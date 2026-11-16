@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Read the release version
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set the version from the tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          scripts/set-version.sh "$VERSION"
+          grep -qxF "version = \"$VERSION\"" Cargo.toml || {
+            echo "::error::Cargo.toml does not carry $VERSION after the rewrite"
+            exit 1
+          }
+
+      - name: Check the formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Look the version up on crates.io
+        id: registry
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: pangolin-tun-release' "https://crates.io/api/v1/crates/pangolin-tun/$VERSION" || true)
+          case "$status" in
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            200) echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::cannot tell whether crates.io carries pangolin-tun $VERSION (HTTP $status)"
+              exit 1
+              ;;
+          esac
+
+      - name: Report the published version
+        if: steps.registry.outputs.published == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: echo "pangolin-tun $VERSION is already published on crates.io, skipping the upload"
+
+      - name: Publish to crates.io
+        if: steps.registry.outputs.published == 'false'
+        run: cargo publish --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
