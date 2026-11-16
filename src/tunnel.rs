@@ -232,10 +232,16 @@ pub fn decode_connect(line: &[u8]) -> Result<(String, u16)> {
 
 /// The tun's answer to a `CONNECT` instruction: `OK\r\n`, or
 /// `ERR <reason>\r\n` when the target could not be reached.
+///
+/// The reason is one line: CR and LF are replaced with a space, so a
+/// reason can never smuggle a second line into the gateway's stream.
 pub fn encode_connect_reply(result: std::result::Result<(), &str>) -> Vec<u8> {
     match result {
         Ok(()) => b"OK\r\n".to_vec(),
-        Err(reason) => format!("ERR {reason}\r\n").into_bytes(),
+        Err(reason) => {
+            let reason = reason.replace(['\r', '\n'], " ");
+            format!("ERR {reason}\r\n").into_bytes()
+        }
     }
 }
 
@@ -608,6 +614,25 @@ mod tests {
         );
         let err = decode_connect_reply(&encode_connect_reply(Err("no route to host"))).unwrap();
         assert_eq!(err, Err("no route to host".to_string()));
+    }
+
+    /// The reason of an `ERR` reply is one line: a reason carrying a
+    /// line break would smuggle a second line into the gateway's
+    /// stream.
+    #[test]
+    fn the_err_reason_stays_on_one_line() {
+        let bytes = encode_connect_reply(Err("no route\r\nCONNECT other:1"));
+        assert_eq!(
+            bytes.iter().filter(|b| **b == b'\n').count(),
+            1,
+            "the reply must not contain a second line: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.lines().any(|line| line.starts_with("CONNECT")),
+            "the reason must not become a line of its own: {text}"
+        );
     }
 
     /// An unknown reply is a protocol error, not a silent success.
