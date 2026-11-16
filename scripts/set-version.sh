@@ -26,7 +26,7 @@ case "$version" in
     *[[:space:]]*) invalid "$version" ;;
 esac
 
-if [ -z "$(printf '%s' "$version" | sed -n -E '/^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$/p')" ]; then
+if [ -z "$(printf '%s' "$version" | sed -n -E '/^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/p')" ]; then
     invalid "$version"
 fi
 
@@ -36,5 +36,13 @@ rewrite() {
 }
 
 rewrite "s|^version = \"[^\"]*\"\$|version = \"$version\"|" Cargo.toml
+
+# The rewrite has to have taken: a manifest the pattern does not
+# match would be reported as rewritten while it still carries the old
+# version.
+if ! grep -qxF "version = \"$version\"" Cargo.toml; then
+    printf "error: Cargo.toml does not carry %s after the rewrite\n" "$version" >&2
+    exit 1
+fi
 
 printf '%s\n' Cargo.toml

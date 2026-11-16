@@ -21,16 +21,20 @@ lint:
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 
-check: fmt lint test doc
+# `fmt-check`, not `fmt`: a check that rewrites the tree leaves it
+# dirty, and the release target refuses to run on a dirty tree.
+check: fmt-check lint test doc
 
 clean:
 	cargo clean
 
 release:
 	@test -n "$(VERSION)" || { echo "VERSION is required, for example: make release VERSION=0.1.0" >&2; exit 1; }
-	@printf '%s' "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$$' || { echo "VERSION '$(VERSION)' is not a valid version, expected x.y.z or x.y.z-<suffix>" >&2; exit 1; }
+	@printf '%s' "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$$' || { echo "VERSION '$(VERSION)' is not a valid version, expected x.y.z or x.y.z-<suffix>" >&2; exit 1; }
 	@test -z "$$(git status --porcelain)" || { echo "the working tree has uncommitted changes" >&2; exit 1; }
-	@if git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null; then echo "the tag v$(VERSION) already exists locally" >&2; exit 1; fi
+	@branch=$$(git symbolic-ref --short HEAD 2>/dev/null || echo detached); \
+		test "$$branch" = "main" || { echo "the release runs on main, not $$branch — a feature branch must go through a pull request" >&2; exit 1; }
+	@if git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null; then echo "the tag v$(VERSION) already exists locally; finish the release with: gh release create v$(VERSION)" >&2; exit 1; fi
 	@remote_tags=$$(git ls-remote --tags origin "v$(VERSION)") || { echo "cannot reach origin to look for the tag v$(VERSION)" >&2; exit 1; }; \
 		test -z "$$remote_tags" || { echo "the tag v$(VERSION) already exists on origin" >&2; exit 1; }
 	@status=$$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: pangolin-tun-release' "https://crates.io/api/v1/crates/pangolin-tun/$(VERSION)" || true); \

@@ -13,8 +13,11 @@ categories = ["network-programming"]
 
 [dependencies]
 async-trait = "0.1"
-base64 = "0.22"
-fastwebsockets = { version = "0.10", features = ["upgrade"] }
+base64 = "0.23"
+# The `upgrade` feature is off: the crate handshakes the WebSocket
+# itself (`WebSocket::after_handshake`), so it needs neither the
+# server-side upgrade helpers nor hyper.
+fastwebsockets = "0.10"
 futures-util = "0.3"
 log = "0.4"
 parking_lot = "0.12"
@@ -44,13 +47,6 @@ tokio = { version = "1", default-features = false, features = [
 tokio-yamux = { version = "0.3", default-features = false, features = ["tokio-timer"] }
 
 [dev-dependencies]
-# The QUIC test gateway keeps its endpoint alive next to the
-# connection — dropping the endpoint tears the connection down.
-quinn = { version = "0.11", default-features = false, features = [
-    "runtime-tokio",
-    "rustls-ring",
-    "log",
-] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

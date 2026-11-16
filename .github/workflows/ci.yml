@@ -8,9 +8,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,5 +29,16 @@ jobs:
         run: cargo test --all-features
       - name: Build the documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
-      - name: Build the crate on its own
-        run: cargo build --all-features
+
+  # The manifest declares the minimum supported Rust version. CI on
+  # the floating stable does not enforce it: a contributor can use a
+  # newer API, CI stays green, and the crate then fails to build for
+  # the users it claims to support.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Build against the declared minimum supported Rust version
+        run: cargo check --all-targets --all-features
