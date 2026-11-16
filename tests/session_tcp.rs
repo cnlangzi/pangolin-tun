@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{DEADLINE, SETTLE, echo_backend, ws_gateway};
+use common::{DEADLINE, echo_backend, ws_gateway};
 use pangolin_tun::{
     SessionOutcome, TUNNEL_VERSION_HEADER, TransportKind, TransportSelector, TunSettings,
     TunnelClient, encode_connect, read_crlf_line,
@@ -45,10 +45,10 @@ async fn a_session_over_the_websocket_transport_relays_the_bytes() {
             .map(|(_, value)| value.as_str());
         assert_eq!(version, Some("2"));
 
-        // Let the client finish reading the 101 response before the
-        // first stream's bytes go out.
-        tokio::time::sleep(SETTLE).await;
-
+        // The gateway opens the stream right away: the client's
+        // reader stops at the end of the 101 response, so the
+        // stream's first bytes are still in the socket when the
+        // client's yamux session picks them up.
         let mut stream = tunnel.open_stream().await.unwrap();
         stream
             .write_all(&encode_connect("127.0.0.1", backend_port))
@@ -104,8 +104,6 @@ async fn a_target_that_cannot_be_reached_is_answered_with_err() {
 
     let gateway_task = tokio::spawn(async move {
         let tunnel = gateway.tunnel.await.unwrap();
-        tokio::time::sleep(SETTLE).await;
-
         let mut stream = tunnel.open_stream().await.unwrap();
         stream
             .write_all(&encode_connect("127.0.0.1", 1))

@@ -659,8 +659,15 @@ pub async fn read_ws_accept_response<R>(r: &mut R, expected_key: &str) -> Result
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = Vec::with_capacity(512);
-    let mut tmp = [0u8; 512];
+    // **The read is one byte at a time on purpose.** The bytes that
+    // follow the 101 response are the first frames of the WebSocket
+    // session, so a buffered read that stopped at the header end
+    // would have to hand the rest back to the caller — and a read
+    // that simply swallowed them would destroy the first frame of
+    // the session. One byte at a time leaves the stream exactly
+    // where the response ended.
+    let mut buf = Vec::with_capacity(256);
+    let mut tmp = [0u8; 1];
     loop {
         let n = r.read(&mut tmp).await?;
         if n == 0 {
@@ -669,9 +676,10 @@ where
                 "eof in 101 response",
             )));
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(idx) = find_header_end(&buf) {
-            let head = std::str::from_utf8(&buf[..idx])
+        buf.push(tmp[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            // The terminator is not part of the head.
+            let head = std::str::from_utf8(&buf[..buf.len() - 4])
                 .map_err(|e| TunnelError::Protocol(format!("utf-8: {e}")))?;
             let status_line = head.lines().next().unwrap_or("");
             if !status_line.contains(" 101 ") {
@@ -816,6 +824,29 @@ mod tests {
         let dumped = format!("{request:?}");
         assert!(!dumped.contains("secret-token"), "{dumped}");
         assert!(dumped.contains("<redacted>"), "{dumped}");
+    }
+
+    /// The bytes that follow the 101 response are the first frames
+    /// of the session: the reader must not swallow them.
+    #[tokio::test]
+    async fn the_accept_response_leaves_the_rest_of_the_stream() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let key = generate_ws_key();
+        let mut response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Sec-WebSocket-Accept: {}\r\n\
+             \r\n",
+            compute_ws_accept(&key)
+        )
+        .into_bytes();
+        response.extend_from_slice(b"the first frame");
+        server.write_all(&response).await.unwrap();
+
+        read_ws_accept_response(&mut client, &key).await.unwrap();
+
+        let mut rest = [0u8; 15];
+        client.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"the first frame");
     }
 
     /// The upgrade request carries the protocol version as an extra

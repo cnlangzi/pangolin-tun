@@ -16,15 +16,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-/// How long a gateway waits after the WebSocket upgrade before it
-/// opens a stream.
-///
-/// The client creates its yamux session right after it read the 101
-/// response. A gateway that opened a stream before that read
-/// completed would put the stream's first bytes into the same read
-/// that carried the 101 — and the client would never see them.
-pub const SETTLE: Duration = Duration::from_millis(100);
-
 /// The longest a test waits for something that should happen at once.
 pub const DEADLINE: Duration = Duration::from_secs(15);
 
