@@ -73,7 +73,10 @@ request; the client accepts them.
 The transport is chosen **once per session**.
 
 A client that prefers QUIC attempts it with the five-second handshake
-timeout. When the attempt fails:
+timeout. A gateway's name can resolve to several addresses, and every one of
+them is tried — the resolver's order is OS-dependent, and a gateway whose
+first address does not answer must not cost a fallback to the unencrypted
+transport. When the attempt fails:
 
 - **the gateway could not be reached** — UDP is blocked, the address is
   wrong, the handshake timed out — the client falls back to the WebSocket/TCP
@@ -85,8 +88,9 @@ timeout. When the attempt fails:
   unencrypted, so falling back would hand the bearer token to whoever is
   presenting the wrong certificate.
 - **the gateway refused the session** — a bad token, a protocol version
-  mismatch — the client does **not** fall back either. The fallback carries
-  the same refused token in cleartext, for no gain.
+  mismatch, or a session that did not come up after the handshake — the
+  client does **not** fall back either. The gateway was reached, and the
+  fallback carries the same token in cleartext, for no gain.
 
 A client that is pinned to one transport never attempts the other.
 

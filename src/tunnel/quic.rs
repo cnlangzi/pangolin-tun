@@ -24,7 +24,7 @@
 //! the token against the `tun` table before it opens any request
 //! stream on that connection.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -92,7 +92,25 @@ impl QuicCert {
     pub fn load_or_generate(dir: &Path) -> Result<Self> {
         let cert_path = dir.join(QUIC_CERT_FILE);
         let key_path = dir.join(QUIC_KEY_FILE);
-        if cert_path.exists() && key_path.exists() {
+        let cert_exists = cert_path.exists();
+        let key_exists = key_path.exists();
+        if cert_exists != key_exists {
+            // Only one of the two is there. Generating a new pair
+            // would change the fingerprint, and every client that
+            // pinned the old one would refuse the gateway — so say
+            // what is missing instead of rotating the certificate.
+            let missing = if cert_exists {
+                QUIC_KEY_FILE
+            } else {
+                QUIC_CERT_FILE
+            };
+            return Err(TunnelError::Invalid(format!(
+                "{} is missing next to the tunnel certificate — refusing to generate a new \
+                 certificate, because that would change the fingerprint every client pinned",
+                dir.join(missing).display()
+            )));
+        }
+        if cert_exists && key_exists {
             let cert_pem = std::fs::read(&cert_path).map_err(|e| {
                 TunnelError::Io(std::io::Error::other(format!(
                     "read {}: {e}",
@@ -306,9 +324,10 @@ pub enum QuicConnectError {
     /// would hand the bearer token to whoever is presenting the
     /// wrong certificate.
     Untrusted(String),
-    /// The gateway refused the session — a bad token or a protocol
-    /// version mismatch. The tun MUST NOT fall back either: the
-    /// fallback carries the same (refused) token in cleartext.
+    /// The gateway refused the session — a bad token, a protocol
+    /// version mismatch — or the session did not come up after the
+    /// handshake. The tun MUST NOT fall back either: the gateway was
+    /// reached, and the fallback carries the same token in cleartext.
     Refused(String),
     /// The certificate was accepted but the pin could not be
     /// recorded, so the trust could not be established for the next
@@ -399,7 +418,7 @@ impl QuicClientTransport {
         // paired with a keep-alive so a quiet connection stays open.
         config.transport_config(Arc::new(transport_config()));
 
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+        let mut endpoint = quinn::Endpoint::client(bind_address(addr))
             .map_err(|e| QuicConnectError::Unreachable(format!("quic endpoint: {e}")))?;
         endpoint.set_default_client_config(config);
 
@@ -576,6 +595,20 @@ pub fn certificate_dir(cert_dir: &Path) -> PathBuf {
     cert_dir.join("tunnel")
 }
 
+/// The local address the client's QUIC endpoint binds.
+///
+/// The socket has to be in the **same address family** as the
+/// gateway: an IPv4 socket cannot reach an IPv6 gateway at all, and
+/// the attempt would fail as "unreachable" — which is the failure
+/// that makes the client fall back to the unencrypted transport.
+fn bind_address(target: SocketAddr) -> SocketAddr {
+    if target.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    }
+}
+
 /// The QUIC transport settings for a tunnel session.
 ///
 /// A tunnel session is long-lived — a WebSocket connection can sit
@@ -632,6 +665,24 @@ mod tests {
         assert_eq!(first.key_der, second.key_der);
     }
 
+    /// A missing **key** is an error, not a reason to rotate the
+    /// certificate: rotating it would change the fingerprint and every
+    /// client that pinned the old one would refuse the gateway.
+    #[test]
+    fn a_missing_key_is_refused_rather_than_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = QuicCert::load_or_generate(dir.path()).unwrap();
+        std::fs::remove_file(dir.path().join(QUIC_KEY_FILE)).unwrap();
+        let err = QuicCert::load_or_generate(dir.path()).unwrap_err();
+        assert!(matches!(err, TunnelError::Invalid(_)), "{err}");
+        // The certificate on disk is untouched.
+        assert!(
+            QuicCert::load_or_generate(dir.path()).is_err(),
+            "the pair must stay broken until it is repaired by hand"
+        );
+        let _ = first;
+    }
+
     /// A deleted certificate is regenerated — but then the fingerprint
     /// changes, which is exactly why the tun's pin has to be updated.
     #[test]
@@ -642,6 +693,19 @@ mod tests {
         std::fs::remove_file(dir.path().join(QUIC_KEY_FILE)).unwrap();
         let second = QuicCert::load_or_generate(dir.path()).unwrap();
         assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    /// The client's endpoint binds the gateway's address family: an
+    /// IPv4 socket cannot reach an IPv6 gateway at all.
+    #[test]
+    fn the_endpoint_binds_the_gateway_s_address_family() {
+        let v4: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        assert!(bind_address(v4).is_ipv4());
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert!(bind_address(v6).is_ipv6());
+        // The port is picked by the operating system.
+        assert_eq!(bind_address(v4).port(), 0);
+        assert_eq!(bind_address(v6).port(), 0);
     }
 
     /// The QUIC error keeps its own variants when it becomes the

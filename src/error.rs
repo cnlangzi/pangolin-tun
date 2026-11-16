@@ -30,8 +30,10 @@ pub enum Error {
     /// certificate.
     #[error("untrusted: {0}")]
     Untrusted(String),
-    /// The gateway refused the session — a bad token or a protocol
-    /// version mismatch.
+    /// The gateway refused the session — a bad token, a protocol
+    /// version mismatch — or the session did not come up after the
+    /// handshake. The gateway was reached, so a fallback to the
+    /// unencrypted transport is not allowed.
     #[error("refused: {0}")]
     Refused(String),
 }

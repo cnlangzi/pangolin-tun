@@ -52,7 +52,7 @@ use tokio::time::sleep;
 use crate::error::{Error as TunnelError, Result};
 use crate::settings::{TransportSelector, TunSettings};
 use crate::tunnel::pin::PinStore;
-use crate::tunnel::quic::{QuicClientTransport, QuicConnectError};
+use crate::tunnel::quic::{QuicClientTransport, QuicConnectError, QuicHandshake};
 use crate::tunnel::ws::{
     TUNNEL_VERSION_HEADER, WsRole, build_ws_upgrade_request, read_ws_accept_response,
     tunnel_over_websocket,
@@ -329,7 +329,7 @@ impl TunnelClient {
         host: &str,
         port: u16,
     ) -> std::result::Result<Arc<dyn TunnelTransport>, QuicConnectError> {
-        let addr = resolve_server(host, port)
+        let addrs = resolve_server(host, port)
             .await
             .map_err(|e| QuicConnectError::Unreachable(e.to_string()))?;
         let server_name = host.to_string();
@@ -340,17 +340,7 @@ impl TunnelClient {
             ))
         })?;
 
-        let (transport, handshake) = tokio::time::timeout(
-            Duration::from_secs(QUIC_HANDSHAKE_TIMEOUT_SECS),
-            QuicClientTransport::connect(addr, &server_name, &pins),
-        )
-        .await
-        .map_err(|_| {
-            QuicConnectError::Unreachable(format!(
-                "the QUIC handshake to {} timed out after {QUIC_HANDSHAKE_TIMEOUT_SECS}s",
-                self.settings.server
-            ))
-        })??;
+        let (transport, handshake) = self.connect_quic_over(&addrs, &server_name, &pins).await?;
 
         // The first contact is the weak spot of any trust-on-first-use
         // scheme: the operator compares this fingerprint against the
@@ -368,9 +358,16 @@ impl TunnelClient {
 
         // QUIC has no upgrade request to carry the token in, so the
         // client opens a control stream and authenticates there.
-        let mut control = transport.open_stream().await.map_err(|e| {
-            QuicConnectError::Unreachable(format!("open the QUIC control stream: {e}"))
-        })?;
+        //
+        // A failure here is **not** "the gateway is unreachable": the
+        // handshake completed, so the gateway was reached. Calling it
+        // unreachable would let the client fall back to the
+        // unencrypted transport and hand the bearer token to the very
+        // gateway that just failed the exchange.
+        let mut control = transport
+            .open_stream()
+            .await
+            .map_err(|e| QuicConnectError::Refused(format!("open the QUIC control stream: {e}")))?;
         control
             .write_all(&encode_auth(
                 &self.settings.token,
@@ -378,24 +375,24 @@ impl TunnelClient {
                 TUNNEL_PROTOCOL_VERSION,
             ))
             .await
-            .map_err(|e| QuicConnectError::Unreachable(format!("write the AUTH line: {e}")))?;
+            .map_err(|e| QuicConnectError::Refused(format!("write the AUTH line: {e}")))?;
         control
             .flush()
             .await
-            .map_err(|e| QuicConnectError::Unreachable(format!("flush the AUTH line: {e}")))?;
+            .map_err(|e| QuicConnectError::Refused(format!("flush the AUTH line: {e}")))?;
         let reply = tokio::time::timeout(
             Duration::from_secs(AUTH_REPLY_TIMEOUT_SECS),
             read_crlf_line(&mut control, MAX_INSTRUCTION_LEN),
         )
         .await
         .map_err(|_| {
-            QuicConnectError::Unreachable(format!(
+            QuicConnectError::Refused(format!(
                 "the gateway did not answer the AUTH line within {AUTH_REPLY_TIMEOUT_SECS}s"
             ))
         })?
-        .map_err(|e| QuicConnectError::Unreachable(format!("read the AUTH reply: {e}")))?;
+        .map_err(|e| QuicConnectError::Refused(format!("read the AUTH reply: {e}")))?;
         match decode_auth_reply(reply.as_bytes())
-            .map_err(|e| QuicConnectError::Unreachable(e.to_string()))?
+            .map_err(|e| QuicConnectError::Refused(e.to_string()))?
         {
             Ok(version) => {
                 if version != TUNNEL_PROTOCOL_VERSION {
@@ -417,6 +414,45 @@ impl TunnelClient {
             self.settings.name, self.settings.server
         );
         Ok(Arc::new(transport))
+    }
+
+    /// Establish the QUIC connection, trying every address the
+    /// gateway's name resolves to.
+    ///
+    /// The resolver's order is OS-dependent, and a gateway whose
+    /// first address does not answer must not cost a fallback to the
+    /// unencrypted transport — the next address is tried instead. A
+    /// trust failure or a refusal is the same for every address, so
+    /// it ends the attempt right away.
+    async fn connect_quic_over(
+        &self,
+        addrs: &[SocketAddr],
+        server_name: &str,
+        pins: &PinStore,
+    ) -> std::result::Result<(QuicClientTransport, QuicHandshake), QuicConnectError> {
+        let mut last: Option<QuicConnectError> = None;
+        for addr in addrs {
+            match tokio::time::timeout(
+                Duration::from_secs(QUIC_HANDSHAKE_TIMEOUT_SECS),
+                QuicClientTransport::connect(*addr, server_name, pins),
+            )
+            .await
+            {
+                Ok(Ok(connected)) => return Ok(connected),
+                Ok(Err(e)) if !matches!(e, QuicConnectError::Unreachable(_)) => return Err(e),
+                Ok(Err(e)) => last = Some(e),
+                Err(_) => {
+                    last = Some(QuicConnectError::Unreachable(format!(
+                        "the QUIC handshake to {addr} timed out after {QUIC_HANDSHAKE_TIMEOUT_SECS}s"
+                    )))
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            QuicConnectError::Unreachable(format!(
+                "the server address {server_name} did not resolve to any address"
+            ))
+        }))
     }
 
     /// Connect over the WebSocket/TCP fallback transport.
@@ -473,6 +509,18 @@ impl TunnelClient {
     /// Record the time of the failed QUIC attempt so the next session
     /// goes straight to the fallback.
     fn record_quic_failure(&self) {
+        // The record has to land in a directory that exists: without
+        // it the write fails, the probe is not skipped and every
+        // reconnect pays the handshake timeout again.
+        if let Some(parent) = self.settings.quic_failure_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            warn!(
+                "tun {}: could not create {}: {e}",
+                self.settings.name,
+                parent.display()
+            );
+        }
         if let Err(e) = std::fs::write(&self.settings.quic_failure_path, unix_now().to_string()) {
             warn!(
                 "tun {}: could not record the QUIC failure in {}: {}",
@@ -509,17 +557,22 @@ fn parse_server(server: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
-/// Resolve `host` into a socket address.
+/// Resolve `host` into the socket addresses it answers on.
 ///
-/// The address is used for the QUIC handshake; the host name itself
-/// is what the TLS handshake presents.
-async fn resolve_server(host: &str, port: u16) -> Result<SocketAddr> {
+/// Every address is returned: the resolver's order is OS-dependent,
+/// and the client tries them in turn. The host name itself is what
+/// the TLS handshake presents.
+async fn resolve_server(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     let addrs = tokio::net::lookup_host((host, port)).await.map_err(|e| {
         TunnelError::Unreachable(format!("resolve the server address {host}:{port}: {e}"))
     })?;
-    addrs.into_iter().next().ok_or_else(|| {
-        TunnelError::Unreachable(format!("the server address {host}:{port} did not resolve"))
-    })
+    let addrs: Vec<SocketAddr> = addrs.collect();
+    if addrs.is_empty() {
+        return Err(TunnelError::Unreachable(format!(
+            "the server address {host}:{port} did not resolve"
+        )));
+    }
+    Ok(addrs)
 }
 
 struct OwnedTcpHalf {
@@ -693,6 +746,16 @@ mod tests {
         let (host, port) = parse_server("[::1]:9001").unwrap();
         assert_eq!(host, "::1");
         assert_eq!(port, 9001);
+    }
+
+    /// The resolver's answers are all returned: the client tries them
+    /// in turn, because the order is OS-dependent and a gateway whose
+    /// first address does not answer must not cost a fallback to the
+    /// unencrypted transport.
+    #[tokio::test]
+    async fn every_resolved_address_is_returned() {
+        let addrs = resolve_server("localhost", 9001).await.unwrap();
+        assert!(!addrs.is_empty(), "localhost must resolve to an address");
     }
 
     /// An address without a port is refused up front rather than at
