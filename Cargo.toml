@@ -1,0 +1,62 @@
+[package]
+name = "pangolin-tun"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "Pangolin tunnel protocol and client: QUIC, with a WebSocket/TCP fallback"
+repository = "https://github.com/cnlangzi/pangolin-tun"
+documentation = "https://docs.rs/pangolin-tun"
+readme = "README.md"
+keywords = ["tunnel", "quic", "proxy", "networking", "websocket"]
+categories = ["network-programming"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+fastwebsockets = { version = "0.10", features = ["upgrade"] }
+futures-util = "0.3"
+log = "0.4"
+parking_lot = "0.12"
+# The tunnel's primary transport. `platform-verifier` is off: the tun
+# pins the gateway's certificate by fingerprint (trust on first use),
+# so it never consults a root store.
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
+rand = "0.8"
+# The gateway's self-signed certificate for its QUIC endpoint.
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha1 = "0.10"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time",
+] }
+tokio-yamux = { version = "0.3", default-features = false, features = ["tokio-timer"] }
+
+[dev-dependencies]
+# The QUIC test gateway keeps its endpoint alive next to the
+# connection — dropping the endpoint tears the connection down.
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
