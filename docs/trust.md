@@ -47,6 +47,10 @@ fingerprints it trusts, one per line:
   the operator copying certificates between nodes.
 - The fingerprints are compared case-insensitively; the file is written in
   lower case.
+- The file is written **atomically**: the list goes into a temporary file
+  next to it and is renamed over it. A crash can therefore not leave an
+  empty pin file behind — and an empty file reads as "first contact", which
+  would re-arm trust on first use.
 
 A missing pin file is an **empty** list — the trust-on-first-use starting
 point, not an error.

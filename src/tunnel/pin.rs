@@ -175,12 +175,38 @@ impl PinStore {
                 ))
             })?;
         }
-        std::fs::write(&self.path, body).map_err(|e| {
-            TunnelError::Io(std::io::Error::new(
+        // The write is **atomic**: the list goes into a temporary file
+        // next to the pin file and is renamed over it. A plain write
+        // truncates the file first, and a crash in between would leave
+        // an empty pin file — which the trust-on-first-use scheme
+        // reads as "first contact", so the next connection would pin
+        // whatever certificate it is offered.
+        let tmp = self.temp_path();
+        if let Err(e) = std::fs::write(&tmp, body) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(TunnelError::Io(std::io::Error::new(
                 e.kind(),
                 format!("write the pin file {}: {e}", self.path.display()),
-            ))
-        })
+            )));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(TunnelError::Io(std::io::Error::new(
+                e.kind(),
+                format!("write the pin file {}: {e}", self.path.display()),
+            )));
+        }
+        Ok(())
+    }
+
+    /// The path of the temporary file the pin file is written through.
+    fn temp_path(&self) -> PathBuf {
+        let name = self
+            .path
+            .file_name()
+            .map(|n| format!("{}.tmp", n.to_string_lossy()))
+            .unwrap_or_else(|| "pins.tmp".to_string());
+        self.path.with_file_name(name)
     }
 }
 
@@ -453,6 +479,32 @@ mod tests {
         let (store, _dir) = store_with(&["aa"]);
         assert!(store.remove("AA").unwrap());
         assert!(store.pins().is_empty());
+    }
+
+    /// The pin file is written through a temporary file, so a crash
+    /// cannot leave an empty pin file behind — an empty file reads as
+    /// "first contact" and would re-arm trust on first use.
+    #[test]
+    fn the_pin_file_is_written_through_a_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tun.pins");
+        let store = PinStore::open(&path).unwrap();
+        store.add("aa").unwrap();
+
+        // No temporary file is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a temporary file was left: {leftovers:?}"
+        );
+
+        // The file the store wrote is the one that is there.
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 4);
     }
 
     /// Clearing the store leaves an empty list on disk, so the next
