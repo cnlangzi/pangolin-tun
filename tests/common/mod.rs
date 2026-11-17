@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use pangolin_tun::{
@@ -79,6 +81,48 @@ pub async fn ws_gateway() -> WsGateway {
         request,
         tunnel,
     }
+}
+
+/// A test gateway that accepts the WebSocket/TCP connection and never
+/// answers the upgrade request.
+///
+/// It counts the upgrade requests it receives, so a test can see that
+/// the client came back for another attempt.
+pub struct SilentWsGateway {
+    /// The address the client dials.
+    pub addr: String,
+    requests: Arc<AtomicUsize>,
+}
+
+impl SilentWsGateway {
+    /// How many upgrade requests the gateway has received.
+    pub fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+/// Bind a WebSocket/TCP test gateway that never answers the upgrade
+/// request.
+///
+/// The connection stays open and silent: the client has to give up on
+/// it on its own.
+pub async fn silent_ws_gateway() -> SilentWsGateway {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let _ = read_ws_upgrade_request(&mut stream).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                // The connection stays open and unanswered.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    SilentWsGateway { addr, requests }
 }
 
 /// A test gateway that speaks the QUIC transport.

@@ -3,12 +3,21 @@
 
 mod common;
 
-use common::{DEADLINE, echo_backend, ws_gateway};
+use std::time::Duration;
+
+use common::{DEADLINE, echo_backend, silent_ws_gateway, ws_gateway};
 use pangolin_tun::{
     SessionOutcome, TUNNEL_VERSION_HEADER, TransportKind, TransportSelector, TunSettings,
     TunnelClient, encode_connect, read_crlf_line,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// How long the reconnect test waits for the client's second attempt.
+///
+/// The client waits for the upgrade timeout (10s), backs off (1s) and
+/// comes back — so the second attempt reaches the gateway a little
+/// over eleven seconds from the start.
+const RECONNECT_DEADLINE: Duration = Duration::from_secs(20);
 
 /// The client's session relays the gateway's bytes to the backend and
 /// the backend's bytes back.
@@ -166,4 +175,69 @@ async fn a_gateway_that_is_not_there_is_unreachable() {
         }
         other => panic!("the session must not have been established: {other:?}"),
     }
+}
+
+/// A gateway that accepts the connection and never answers the
+/// upgrade request is **refused**: the client gives up on it instead
+/// of waiting forever.
+#[tokio::test]
+async fn a_gateway_that_never_answers_the_upgrade_is_refused() {
+    let gateway = silent_ws_gateway().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = TunnelClient::new(TunSettings {
+        server: gateway.addr.clone(),
+        token: "secret-token".into(),
+        name: "office".into(),
+        transport: TransportSelector::Tcp,
+        pin_path: dir.path().join("tun.pins"),
+        quic_failure_path: dir.path().join("tun.quic-fail"),
+    });
+
+    let outcome = tokio::time::timeout(DEADLINE, client.connect_once())
+        .await
+        .expect("the connect attempt must not hang");
+
+    match outcome {
+        SessionOutcome::NotConnected { transport, error } => {
+            assert_eq!(transport, Some(TransportKind::Tcp));
+            assert!(
+                matches!(error, pangolin_tun::Error::Refused(_)),
+                "a gateway that says nothing is refused: {error}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "refused: the gateway did not answer the upgrade within 10s",
+                "the error must name the timeout"
+            );
+        }
+        other => panic!("the session must not have been established: {other:?}"),
+    }
+}
+
+/// The client does not get stuck on a gateway that says nothing: the
+/// reconnect loop takes over and makes a new attempt.
+#[tokio::test]
+async fn a_gateway_that_never_answers_the_upgrade_does_not_stick_the_client() {
+    let gateway = silent_ws_gateway().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = TunnelClient::new(TunSettings {
+        server: gateway.addr.clone(),
+        token: "secret-token".into(),
+        name: "office".into(),
+        transport: TransportSelector::Tcp,
+        pin_path: dir.path().join("tun.pins"),
+        quic_failure_path: dir.path().join("tun.quic-fail"),
+    });
+
+    let run = tokio::spawn(async move { client.run().await });
+    tokio::time::timeout(RECONNECT_DEADLINE, async {
+        while gateway.requests() < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the client must come back for a second attempt");
+    run.abort();
 }
