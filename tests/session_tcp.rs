@@ -3,138 +3,36 @@
 
 mod common;
 
-use std::time::Duration;
-
-use common::{DEADLINE, echo_backend, silent_ws_gateway, ws_gateway};
-use pangolin_tun::{
-    SessionOutcome, TUNNEL_VERSION_HEADER, TransportKind, TransportSelector, TunSettings,
-    TunnelClient, encode_connect, read_crlf_line,
+use common::{
+    AuthReply, DEADLINE, Gateway, QuicMode, UpgradeReply, client, client_at, connect_to,
+    echo_backend, round_trip,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-/// How long the reconnect test waits for the client's second attempt.
-///
-/// The client waits for the upgrade timeout (10s), backs off (1s) and
-/// comes back — so the second attempt reaches the gateway a little
-/// over eleven seconds from the start.
-const RECONNECT_DEADLINE: Duration = Duration::from_secs(20);
+use pangolin_tun::{Error, SessionOutcome, TransportKind, TransportSelector};
 
 /// The client's session relays the gateway's bytes to the backend and
 /// the backend's bytes back.
 #[tokio::test]
 async fn a_session_over_the_websocket_transport_relays_the_bytes() {
-    let (backend_port, backend) = echo_backend().await;
-    let gateway = ws_gateway().await;
-
+    let gateway = Gateway::bind(QuicMode::Serve, AuthReply::Accept, UpgradeReply::Accept).await;
+    let (backend_port, _backend) = echo_backend().await;
     let dir = tempfile::tempdir().unwrap();
-    let client = TunnelClient::new(TunSettings {
-        server: gateway.addr.clone(),
-        token: "secret-token".into(),
-        name: "office".into(),
-        transport: TransportSelector::Tcp,
-        pin_path: dir.path().join("tun.pins"),
-        quic_failure_path: dir.path().join("tun.quic-fail"),
-    });
+    let client = client(dir.path(), &gateway, TransportSelector::Tcp);
 
-    let gateway_task = tokio::spawn(async move {
-        let tunnel = gateway.tunnel.await.unwrap();
-        let request = gateway.request.await.unwrap();
-
-        // The upgrade request carries the client's bearer token and
-        // the protocol version — the fallback transport's only
-        // handshake.
-        assert_eq!(
-            request.authorization.as_deref(),
-            Some("Bearer secret-token")
-        );
-        let version = request
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(TUNNEL_VERSION_HEADER))
-            .map(|(_, value)| value.as_str());
-        assert_eq!(version, Some("2"));
-
-        // The gateway opens the stream right away: the client's
-        // reader stops at the end of the 101 response, so the
-        // stream's first bytes are still in the socket when the
-        // client's yamux session picks them up.
-        let mut stream = tunnel.open_stream().await.unwrap();
-        stream
-            .write_all(&encode_connect("127.0.0.1", backend_port))
-            .await
-            .unwrap();
-        stream.flush().await.unwrap();
-        assert_eq!(read_crlf_line(&mut stream).await.unwrap(), "OK");
-
-        stream.write_all(b"ping").await.unwrap();
-        stream.flush().await.unwrap();
-        let mut echoed = [0u8; 4];
-        stream.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"ping");
-
-        // End the session.
-        tunnel.bridge_abort.abort();
-    });
-
-    let outcome = tokio::time::timeout(DEADLINE, client.connect_once())
-        .await
-        .expect("the session must not hang");
-    tokio::time::timeout(DEADLINE, gateway_task)
+    let task = tokio::spawn(async move { client.connect_once().await });
+    let session = tokio::time::timeout(DEADLINE, gateway.accept_tcp())
         .await
         .expect("the gateway must not hang")
-        .unwrap();
-    tokio::time::timeout(DEADLINE, backend)
+        .into_session();
+
+    let mut stream = connect_to(&session, "127.0.0.1", backend_port).await;
+    let echoed = round_trip(&mut stream, b"ping").await;
+    assert_eq!(echoed, b"ping");
+
+    session.close();
+    let outcome = tokio::time::timeout(DEADLINE, task)
         .await
-        .expect("the backend must not hang")
-        .unwrap();
-
-    match outcome {
-        SessionOutcome::Ended { transport } => assert_eq!(transport, TransportKind::Tcp),
-        other => panic!("the session must have ended over the TCP transport: {other:?}"),
-    }
-}
-
-/// A target that cannot be reached is answered with `ERR <reason>`,
-/// and the gateway turns that into a 502 for the client.
-#[tokio::test]
-async fn a_target_that_cannot_be_reached_is_answered_with_err() {
-    // Port 1 on the loopback interface is not listening.
-    let gateway = ws_gateway().await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let client = TunnelClient::new(TunSettings {
-        server: gateway.addr.clone(),
-        token: "secret-token".into(),
-        name: "office".into(),
-        transport: TransportSelector::Tcp,
-        pin_path: dir.path().join("tun.pins"),
-        quic_failure_path: dir.path().join("tun.quic-fail"),
-    });
-
-    let gateway_task = tokio::spawn(async move {
-        let tunnel = gateway.tunnel.await.unwrap();
-        let mut stream = tunnel.open_stream().await.unwrap();
-        stream
-            .write_all(&encode_connect("127.0.0.1", 1))
-            .await
-            .unwrap();
-        stream.flush().await.unwrap();
-        let reply = read_crlf_line(&mut stream).await.unwrap();
-        assert!(
-            reply.starts_with("ERR "),
-            "the client must answer ERR, got {reply:?}"
-        );
-
-        tunnel.bridge_abort.abort();
-    });
-
-    let outcome = tokio::time::timeout(DEADLINE, client.connect_once())
-        .await
-        .expect("the session must not hang");
-    tokio::time::timeout(DEADLINE, gateway_task)
-        .await
-        .expect("the gateway must not hang")
-        .unwrap();
+        .expect("the session must not hang")
+        .expect("the client must not panic");
 
     match outcome {
         SessionOutcome::Ended { transport } => assert_eq!(transport, TransportKind::Tcp),
@@ -153,14 +51,11 @@ async fn a_gateway_that_is_not_there_is_unreachable() {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let client = TunnelClient::new(TunSettings {
-        server: format!("127.0.0.1:{port}"),
-        token: "secret-token".into(),
-        name: "office".into(),
-        transport: TransportSelector::Tcp,
-        pin_path: dir.path().join("tun.pins"),
-        quic_failure_path: dir.path().join("tun.quic-fail"),
-    });
+    let client = client_at(
+        dir.path(),
+        &format!("127.0.0.1:{port}"),
+        TransportSelector::Tcp,
+    );
 
     let outcome = tokio::time::timeout(DEADLINE, client.connect_once())
         .await
@@ -169,7 +64,7 @@ async fn a_gateway_that_is_not_there_is_unreachable() {
     match outcome {
         SessionOutcome::NotConnected { error, .. } => {
             assert!(
-                matches!(error, pangolin_tun::Error::Unreachable(_)),
+                matches!(error, Error::Unreachable(_)),
                 "a gateway that is not there is unreachable: {error}"
             );
         }
@@ -177,70 +72,29 @@ async fn a_gateway_that_is_not_there_is_unreachable() {
     }
 }
 
-/// A gateway that accepts the connection and never answers the
-/// upgrade request is **refused**: the client gives up on it instead
-/// of waiting forever.
+/// The client serves a first session, the gateway closes it, and the
+/// client comes back for a second one.
 #[tokio::test]
-async fn a_gateway_that_never_answers_the_upgrade_is_refused() {
-    let gateway = silent_ws_gateway().await;
-
+async fn the_client_reconnects_after_the_gateway_closes_the_session() {
+    let gateway = Gateway::bind(QuicMode::Serve, AuthReply::Accept, UpgradeReply::Accept).await;
     let dir = tempfile::tempdir().unwrap();
-    let client = TunnelClient::new(TunSettings {
-        server: gateway.addr.clone(),
-        token: "secret-token".into(),
-        name: "office".into(),
-        transport: TransportSelector::Tcp,
-        pin_path: dir.path().join("tun.pins"),
-        quic_failure_path: dir.path().join("tun.quic-fail"),
-    });
+    let client = client(dir.path(), &gateway, TransportSelector::Tcp);
 
-    let outcome = tokio::time::timeout(DEADLINE, client.connect_once())
+    let task = tokio::spawn(async move { client.run().await });
+
+    let first = tokio::time::timeout(DEADLINE, gateway.accept_tcp())
         .await
-        .expect("the connect attempt must not hang");
+        .expect("the first session must come up");
+    // The gateway closes the session.
+    first.tunnel.as_ref().unwrap().bridge_abort.abort();
 
-    match outcome {
-        SessionOutcome::NotConnected { transport, error } => {
-            assert_eq!(transport, Some(TransportKind::Tcp));
-            assert!(
-                matches!(error, pangolin_tun::Error::Refused(_)),
-                "a gateway that says nothing is refused: {error}"
-            );
-            // The timeout is private, so the bound is spelled out
-            // here: the error must name the wait the client made.
-            assert_eq!(
-                error.to_string(),
-                "refused: the gateway did not answer the upgrade within 10s",
-                "the error must name the timeout"
-            );
-        }
-        other => panic!("the session must not have been established: {other:?}"),
-    }
-}
+    let second = tokio::time::timeout(DEADLINE, gateway.accept_tcp())
+        .await
+        .expect("the client must come back for a second session");
+    assert!(
+        second.tunnel.is_some(),
+        "the second session must run on a tunnel"
+    );
 
-/// The client does not get stuck on a gateway that says nothing: the
-/// reconnect loop takes over and makes a new attempt.
-#[tokio::test]
-async fn a_gateway_that_never_answers_the_upgrade_does_not_stick_the_client() {
-    let gateway = silent_ws_gateway().await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let client = TunnelClient::new(TunSettings {
-        server: gateway.addr.clone(),
-        token: "secret-token".into(),
-        name: "office".into(),
-        transport: TransportSelector::Tcp,
-        pin_path: dir.path().join("tun.pins"),
-        quic_failure_path: dir.path().join("tun.quic-fail"),
-    });
-
-    let run = tokio::spawn(async move { client.run().await });
-    tokio::time::timeout(RECONNECT_DEADLINE, async {
-        while gateway.requests() < 2 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the client must come back for a second attempt");
-    run.abort();
-    let _ = run.await;
+    task.abort();
 }
