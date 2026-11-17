@@ -55,7 +55,7 @@ async fn a_session_over_the_websocket_transport_relays_the_bytes() {
             .await
             .unwrap();
         stream.flush().await.unwrap();
-        assert_eq!(read_crlf_line(&mut stream, 4096).await.unwrap(), "OK");
+        assert_eq!(read_crlf_line(&mut stream).await.unwrap(), "OK");
 
         stream.write_all(b"ping").await.unwrap();
         stream.flush().await.unwrap();
@@ -110,7 +110,7 @@ async fn a_target_that_cannot_be_reached_is_answered_with_err() {
             .await
             .unwrap();
         stream.flush().await.unwrap();
-        let reply = read_crlf_line(&mut stream, 4096).await.unwrap();
+        let reply = read_crlf_line(&mut stream).await.unwrap();
         assert!(
             reply.starts_with("ERR "),
             "the client must answer ERR, got {reply:?}"

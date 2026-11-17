@@ -36,7 +36,7 @@ async fn a_session_over_quic_relays_the_bytes() {
         // The control stream: the client authenticates on it before
         // the gateway opens any request stream.
         let mut control = transport.accept_stream().await.unwrap().unwrap();
-        let line = read_crlf_line(&mut control, 4096).await.unwrap();
+        let line = read_crlf_line(&mut control).await.unwrap();
         let (token, name, version) = decode_auth(line.as_bytes()).unwrap();
         assert_eq!(token, "secret-token");
         assert_eq!(name, "office");
@@ -55,7 +55,7 @@ async fn a_session_over_quic_relays_the_bytes() {
             .await
             .unwrap();
         stream.flush().await.unwrap();
-        assert_eq!(read_crlf_line(&mut stream, 4096).await.unwrap(), "OK");
+        assert_eq!(read_crlf_line(&mut stream).await.unwrap(), "OK");
 
         stream.write_all(b"ping").await.unwrap();
         stream.flush().await.unwrap();
