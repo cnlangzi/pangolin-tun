@@ -89,6 +89,9 @@ const AUTH_REPLY_TIMEOUT_SECS: u64 = 10;
 ///
 /// A gateway that accepts the connection but never answers would
 /// otherwise hang the client forever — and the reconnect loop with it.
+///
+/// The bound matches [`AUTH_REPLY_TIMEOUT_SECS`]: a wedged gateway
+/// costs the same wait on either transport.
 const UPGRADE_REPLY_TIMEOUT_SECS: u64 = 10;
 
 /// The outcome of one connect-and-serve cycle.

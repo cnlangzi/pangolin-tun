@@ -115,8 +115,9 @@ pub async fn silent_ws_gateway() -> SilentWsGateway {
         while let Ok((mut stream, _)) = listener.accept().await {
             let counter = counter.clone();
             tokio::spawn(async move {
-                let _ = read_ws_upgrade_request(&mut stream).await;
-                counter.fetch_add(1, Ordering::SeqCst);
+                if read_ws_upgrade_request(&mut stream).await.is_ok() {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
                 // The connection stays open and unanswered.
                 std::future::pending::<()>().await;
             });

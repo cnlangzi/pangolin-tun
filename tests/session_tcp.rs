@@ -205,6 +205,8 @@ async fn a_gateway_that_never_answers_the_upgrade_is_refused() {
                 matches!(error, pangolin_tun::Error::Refused(_)),
                 "a gateway that says nothing is refused: {error}"
             );
+            // The timeout is private, so the bound is spelled out
+            // here: the error must name the wait the client made.
             assert_eq!(
                 error.to_string(),
                 "refused: the gateway did not answer the upgrade within 10s",
@@ -240,4 +242,5 @@ async fn a_gateway_that_never_answers_the_upgrade_does_not_stick_the_client() {
     .await
     .expect("the client must come back for a second attempt");
     run.abort();
+    let _ = run.await;
 }
