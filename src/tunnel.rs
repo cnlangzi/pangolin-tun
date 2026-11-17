@@ -84,7 +84,14 @@ pub mod quic;
 /// The WebSocket/TCP transport.
 pub mod ws;
 
-/// Largest connection instruction the tun accepts.
+/// Largest protocol line the tunnel accepts.
+///
+/// The protocol fixes the length of every line it puts on the wire:
+/// the `CONNECT` instruction, the `OK` / `ERR` reply and the `AUTH`
+/// control line are all at most this long.
+///
+/// The reader applies the limit to the bytes it accumulates before
+/// the LF, so the CR of a CRLF terminator counts against it.
 pub(crate) const MAX_INSTRUCTION_LEN: usize = 4096;
 
 /// Marker for which side of a tunnel we are.
@@ -100,8 +107,7 @@ pub enum TunnelRole {
 /// Which transport carries a tunnel's byte streams.
 ///
 /// Two exist: QUIC (the primary transport) and WebSocket-over-TCP
-/// (the fallback for networks where UDP is blocked). The name is used
-/// in the logs and in the admin UI.
+/// (the fallback for networks where UDP is blocked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
     /// QUIC — one connection per tun, one bidirectional stream per
@@ -112,21 +118,12 @@ pub enum TransportKind {
 }
 
 impl TransportKind {
-    /// The stable, lower-case name used in configuration, logs and
-    /// the admin UI.
+    /// The stable, lower-case name of the transport — the spelling the
+    /// log lines and the admin UI use.
     pub fn as_str(&self) -> &'static str {
         match self {
             TransportKind::Quic => "quic",
             TransportKind::Tcp => "tcp",
-        }
-    }
-
-    /// Parse the name produced by [`TransportKind::as_str`].
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "quic" => Some(TransportKind::Quic),
-            "tcp" | "websocket" | "ws" => Some(TransportKind::Tcp),
-            _ => None,
         }
     }
 }
@@ -145,9 +142,13 @@ impl std::fmt::Display for TransportKind {
 /// byte streams — nothing above this seam knows whether the bytes
 /// travel over a QUIC bidirectional stream or a yamux stream inside a
 /// WebSocket.
-pub trait TunnelByteStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+///
+/// A stream is moved into the one task that serves it, so `Send` is
+/// what the crate needs; `Sync` would constrain every transport's
+/// stream for nothing.
+pub trait TunnelByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> TunnelByteStream for T {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> TunnelByteStream for T {}
 
 /// A boxed tunnel byte stream.
 pub type TunnelStream = Box<dyn TunnelByteStream>;
@@ -374,15 +375,15 @@ pub const TUNNEL_PROTOCOL_VERSION: u32 = 2;
 ///
 /// Used for the `CONNECT` instruction, the `OK` / `ERR` reply and the
 /// `AUTH` control line. The line is returned **without** its
-/// terminator. `max` bounds the read so a peer that never sends a
-/// newline cannot make us allocate without limit.
+/// terminator. The crate enforces the line limit itself, so a peer
+/// that never sends a newline cannot make us allocate without limit.
 ///
 /// **The read is one byte at a time on purpose.** The gateway reads
 /// the tun's `OK` reply off the *same* stream that later carries the
 /// response, so a buffered read would swallow the first response
 /// bytes. One byte at a time leaves the rest of the stream exactly
 /// where it was.
-pub async fn read_crlf_line<R>(r: &mut R, max: usize) -> Result<String>
+pub async fn read_crlf_line<R>(r: &mut R) -> Result<String>
 where
     R: AsyncRead + Unpin,
 {
@@ -403,9 +404,9 @@ where
             return Ok(String::from_utf8_lossy(&buf).into_owned());
         }
         buf.push(tmp[0]);
-        if buf.len() > max {
+        if buf.len() > MAX_INSTRUCTION_LEN {
             return Err(TunnelError::Protocol(format!(
-                "line longer than {max} bytes without a terminator"
+                "line longer than {MAX_INSTRUCTION_LEN} bytes without a terminator"
             )));
         }
     }
@@ -508,7 +509,7 @@ where
     Fut: Future<Output = std::result::Result<B, TunnelError>>,
     B: TunnelByteStream,
 {
-    let line = read_crlf_line(&mut stream, MAX_INSTRUCTION_LEN)
+    let line = read_crlf_line(&mut stream)
         .await
         .map_err(|e| e.with_context("read the CONNECT instruction"))?;
     let (host, port) =
@@ -702,16 +703,14 @@ mod tests {
     // Transport kind
     // -------------------------------------------------------------------
 
-    /// The transport names round-trip through the parser — the tun's
-    /// `transport:` selector and the log lines use the same spelling.
+    /// The transport names are the crate's output vocabulary — the log
+    /// lines and the admin UI print them.
     #[test]
-    fn transport_kind_names_roundtrip() {
-        for kind in [TransportKind::Quic, TransportKind::Tcp] {
-            assert_eq!(TransportKind::parse(kind.as_str()), Some(kind));
-        }
-        assert_eq!(TransportKind::parse("QUIC"), Some(TransportKind::Quic));
-        assert_eq!(TransportKind::parse(" tcp "), Some(TransportKind::Tcp));
-        assert_eq!(TransportKind::parse("carrier-pigeon"), None);
+    fn the_transport_kind_names_are_stable() {
+        assert_eq!(TransportKind::Quic.as_str(), "quic");
+        assert_eq!(TransportKind::Tcp.as_str(), "tcp");
+        assert_eq!(TransportKind::Quic.to_string(), "quic");
+        assert_eq!(TransportKind::Tcp.to_string(), "tcp");
     }
 
     // -------------------------------------------------------------------
@@ -724,7 +723,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(64);
         server.write_all(b"CONNECT host:80\r\nrest").await.unwrap();
         assert_eq!(
-            read_crlf_line(&mut client, 64).await.unwrap(),
+            read_crlf_line(&mut client).await.unwrap(),
             "CONNECT host:80"
         );
     }
@@ -736,20 +735,23 @@ mod tests {
     async fn the_line_reader_leaves_the_rest_of_the_stream() {
         let (mut client, mut server) = tokio::io::duplex(64);
         server.write_all(b"OK\r\npayload").await.unwrap();
-        assert_eq!(read_crlf_line(&mut client, 64).await.unwrap(), "OK");
+        assert_eq!(read_crlf_line(&mut client).await.unwrap(), "OK");
         let mut rest = [0u8; 7];
         client.read_exact(&mut rest).await.unwrap();
         assert_eq!(&rest, b"payload");
     }
 
     /// A peer that never sends a terminator cannot make the reader
-    /// allocate without limit.
+    /// allocate without limit: the protocol's line limit is the
+    /// crate's own.
     #[tokio::test]
     async fn the_line_reader_bounds_the_line() {
-        let (mut client, mut server) = tokio::io::duplex(64);
-        server.write_all(b"0123456789").await.unwrap();
-        let err = read_crlf_line(&mut client, 4).await.unwrap_err();
+        let (mut client, mut server) = tokio::io::duplex(MAX_INSTRUCTION_LEN + 1);
+        let too_long = vec![b'x'; MAX_INSTRUCTION_LEN + 1];
+        server.write_all(&too_long).await.unwrap();
+        let err = read_crlf_line(&mut client).await.unwrap_err();
         assert!(matches!(err, TunnelError::Protocol(_)), "{err}");
+        assert!(err.to_string().contains("4096"), "{err}");
     }
 
     // -------------------------------------------------------------------

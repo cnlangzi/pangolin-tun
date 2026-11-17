@@ -58,8 +58,8 @@ use crate::tunnel::ws::{
     tunnel_over_websocket,
 };
 use crate::tunnel::{
-    MAX_INSTRUCTION_LEN, TUNNEL_PROTOCOL_VERSION, TransportKind, TunnelRole, TunnelTransport,
-    decode_auth_reply, encode_auth, protocol_version_mismatch, read_crlf_line, serve_tunnel_stream,
+    TUNNEL_PROTOCOL_VERSION, TransportKind, TunnelRole, TunnelTransport, decode_auth_reply,
+    encode_auth, protocol_version_mismatch, read_crlf_line, serve_tunnel_stream,
 };
 
 /// How long the client waits for the QUIC handshake before it gives up
@@ -382,7 +382,7 @@ impl TunnelClient {
             .map_err(|e| QuicConnectError::Refused(format!("flush the AUTH line: {e}")))?;
         let reply = tokio::time::timeout(
             Duration::from_secs(AUTH_REPLY_TIMEOUT_SECS),
-            read_crlf_line(&mut control, MAX_INSTRUCTION_LEN),
+            read_crlf_line(&mut control),
         )
         .await
         .map_err(|_| {
@@ -848,7 +848,7 @@ mod tests {
             .await
             .unwrap();
         gateway.flush().await.unwrap();
-        assert_eq!(read_crlf_line(&mut gateway, 4096).await.unwrap(), "OK");
+        assert_eq!(read_crlf_line(&mut gateway).await.unwrap(), "OK");
 
         // The gateway writes the request and ends its direction.
         gateway.write_all(b"ping").await.unwrap();
@@ -898,7 +898,7 @@ mod tests {
             .await
             .unwrap();
         gateway.flush().await.unwrap();
-        assert_eq!(read_crlf_line(&mut gateway, 4096).await.unwrap(), "OK");
+        assert_eq!(read_crlf_line(&mut gateway).await.unwrap(), "OK");
 
         // The gateway reads the answer, then sends what it still had
         // to say.
