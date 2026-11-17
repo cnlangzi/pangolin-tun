@@ -84,6 +84,16 @@ pub const QUIC_PROBE_SKIP_SECS: i64 = 600;
 /// otherwise hang the client's session forever.
 const AUTH_REPLY_TIMEOUT_SECS: u64 = 10;
 
+/// How long the client waits for the gateway's answer to its upgrade
+/// request.
+///
+/// A gateway that accepts the connection but never answers would
+/// otherwise hang the client forever — and the reconnect loop with it.
+///
+/// The bound matches [`AUTH_REPLY_TIMEOUT_SECS`]: a wedged gateway
+/// costs the same wait on either transport.
+const UPGRADE_REPLY_TIMEOUT_SECS: u64 = 10;
+
 /// The outcome of one connect-and-serve cycle.
 ///
 /// The transport is part of the outcome because a session that
@@ -476,9 +486,17 @@ impl TunnelClient {
             .await
             .map_err(TunnelError::Io)?;
         tcp_write.flush().await.map_err(TunnelError::Io)?;
-        read_ws_accept_response(&mut tcp_read, &key)
-            .await
-            .map_err(|e| TunnelError::Refused(format!("the gateway refused the upgrade: {e}")))?;
+        tokio::time::timeout(
+            Duration::from_secs(UPGRADE_REPLY_TIMEOUT_SECS),
+            read_ws_accept_response(&mut tcp_read, &key),
+        )
+        .await
+        .map_err(|_| {
+            TunnelError::Refused(format!(
+                "the gateway did not answer the upgrade within {UPGRADE_REPLY_TIMEOUT_SECS}s"
+            ))
+        })?
+        .map_err(|e| TunnelError::Refused(format!("the gateway refused the upgrade: {e}")))?;
         let ws = fastwebsockets::WebSocket::after_handshake(
             OwnedTcpHalf {
                 reader: tcp_read,

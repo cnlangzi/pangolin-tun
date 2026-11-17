@@ -57,6 +57,10 @@ The gateway answers with `101 Switching Protocols` and a matching
 `Sec-WebSocket-Accept`, or with an HTTP error — a wrong token and a protocol
 version mismatch are both refused here.
 
+The client waits **10 seconds** for that answer. A gateway that accepts the
+connection but never answers would otherwise hang the client forever — and the
+reconnect loop with it.
+
 The `Sec-WebSocket-Key` is 16 random bytes, base64-encoded. The
 `Sec-WebSocket-Accept` is the RFC 6455 §1.3 derivation of it:
 base64(SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")).

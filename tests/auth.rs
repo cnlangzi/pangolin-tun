@@ -266,3 +266,74 @@ async fn a_gateway_that_speaks_another_version_is_refused() {
         other => panic!("the session must not have been established: {other:?}"),
     }
 }
+
+/// A gateway that accepts the WebSocket connection and never answers
+/// the upgrade request would otherwise hang the client's session
+/// forever.
+#[tokio::test]
+async fn a_gateway_that_never_answers_the_upgrade_is_refused() {
+    let gateway = Gateway::bind(QuicMode::Serve, AuthReply::Accept, UpgradeReply::Silent).await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = client(dir.path(), &gateway, TransportSelector::Tcp);
+
+    let task = tokio::spawn(async move { client.connect_once().await });
+    // The session is held for the whole attempt: dropping it would
+    // close the connection and the client would see an end of file
+    // instead of the timeout.
+    let _session = tokio::time::timeout(DEADLINE, gateway.accept_tcp())
+        .await
+        .expect("the gateway must not hang");
+
+    let outcome = tokio::time::timeout(LONG_DEADLINE, task)
+        .await
+        .expect("the connect attempt must not hang")
+        .expect("the client must not panic");
+
+    match outcome {
+        SessionOutcome::NotConnected { transport, error } => {
+            assert_eq!(transport, Some(TransportKind::Tcp));
+            let Error::Refused(message) = error else {
+                panic!("the gateway must have refused the session: {error}");
+            };
+            assert!(
+                message.contains("did not answer"),
+                "the message must say the gateway stayed silent: {message}"
+            );
+            // The crate's upgrade reply timeout is ten seconds; the
+            // message names it so the operator knows how long the tun
+            // waited.
+            assert!(
+                message.contains("10s"),
+                "the message must name the timeout: {message}"
+            );
+        }
+        other => panic!("the session must not have been established: {other:?}"),
+    }
+}
+
+/// The client does not get stuck on a gateway that says nothing: the
+/// reconnect loop takes over and the client comes back.
+#[tokio::test]
+async fn a_gateway_that_never_answers_the_upgrade_does_not_stick_the_client() {
+    let gateway = Gateway::bind(QuicMode::Serve, AuthReply::Accept, UpgradeReply::Silent).await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = client(dir.path(), &gateway, TransportSelector::Tcp);
+
+    let run = tokio::spawn(async move { client.run().await });
+    // The client waits out the upgrade timeout, backs off and comes
+    // back: the gateway accepts a second connection.
+    let _first = tokio::time::timeout(LONG_DEADLINE, gateway.accept_tcp())
+        .await
+        .expect("the gateway must not hang");
+    tokio::time::timeout(LONG_DEADLINE, gateway.accept_tcp())
+        .await
+        .expect("the client must come back for a second attempt");
+
+    assert!(
+        gateway.tcp_connections() >= 2,
+        "the client must have dialled the gateway again: {}",
+        gateway.tcp_connections()
+    );
+    run.abort();
+    let _ = run.await;
+}

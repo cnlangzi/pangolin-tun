@@ -71,6 +71,9 @@ pub enum UpgradeReply {
     Accept,
     /// An HTTP error, e.g. `401 Unauthorized`.
     Refuse { status: u16, reason: String },
+    /// Nothing at all: the gateway accepts the connection and stays
+    /// silent.
+    Silent,
 }
 
 /// A QUIC session the gateway accepted.
@@ -95,6 +98,10 @@ pub struct TcpSession {
     /// The yamux tunnel the session runs on. A refused upgrade has no
     /// tunnel.
     pub tunnel: Option<YamuxTunnel>,
+    /// The connection, when the gateway answered nothing. The session
+    /// holds it open: dropping it would close the connection and the
+    /// tun would see the end of the file instead of the timeout.
+    pub stream: Option<TcpStream>,
 }
 
 /// A gateway session, on either transport.
@@ -475,6 +482,7 @@ async fn serve_tcp(
             let _ = tx.send(TcpSession {
                 upgrade: request,
                 tunnel: Some(tunnel),
+                stream: None,
             });
         }
         UpgradeReply::Refuse { status, reason } => {
@@ -483,6 +491,16 @@ async fn serve_tcp(
             let _ = tx.send(TcpSession {
                 upgrade: request,
                 tunnel: None,
+                stream: None,
+            });
+        }
+        UpgradeReply::Silent => {
+            // Nothing is written and the connection stays open: the
+            // tun has to give up on it on its own.
+            let _ = tx.send(TcpSession {
+                upgrade: request,
+                tunnel: None,
+                stream: Some(stream),
             });
         }
     }
