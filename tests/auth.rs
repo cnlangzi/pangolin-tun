@@ -72,6 +72,11 @@ async fn a_quic_gateway_that_refuses_the_auth_line_is_not_connected() {
 
 /// A gateway that speaks another protocol version is refused, and the
 /// message names both versions.
+///
+/// The crate reports the mismatch as `Untrusted`, because the tun
+/// cannot tell a version mismatch from a wrong certificate until it
+/// has read the gateway's answer — and either way it must not fall
+/// back to the unencrypted transport.
 #[tokio::test]
 async fn a_quic_gateway_that_answers_another_version_is_refused() {
     let gateway = Gateway::bind(
@@ -137,6 +142,9 @@ async fn a_quic_gateway_that_answers_the_auth_line_too_late_is_refused() {
                 message.contains("did not answer"),
                 "the message must say the gateway stayed silent: {message}"
             );
+            // The crate's AUTH reply timeout is ten seconds; the
+            // message names it so the operator knows how long the tun
+            // waited.
             assert!(
                 message.contains("10s"),
                 "the message must name the timeout: {message}"
@@ -170,7 +178,8 @@ async fn the_upgrade_request_carries_the_token_the_name_and_the_version() {
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(TUNNEL_VERSION_HEADER))
         .map(|(_, value)| value.as_str());
-    assert_eq!(version, Some("2"));
+    let expected = TUNNEL_PROTOCOL_VERSION.to_string();
+    assert_eq!(version, Some(expected.as_str()));
 
     session.tunnel.as_ref().unwrap().bridge_abort.abort();
     tokio::time::timeout(DEADLINE, task)

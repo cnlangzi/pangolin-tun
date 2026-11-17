@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{AuthReply, DEADLINE, Gateway, QuicMode, UpgradeReply, client};
+use common::{AuthReply, DEADLINE, Gateway, QuicMode, UpgradeReply, client, outcome_transport};
 use pangolin_tun::{
     Error, PinStore, QuicClientTransport, SessionOutcome, TransportKind, TransportSelector,
 };
@@ -58,12 +58,10 @@ async fn a_pinned_certificate_is_accepted_again() {
         .await
         .expect("the session must not hang")
         .expect("the client must not panic");
-    assert!(
-        matches!(
-            outcome,
-            SessionOutcome::Ended { .. } | SessionOutcome::Errored { .. }
-        ),
-        "the first session must have run: {outcome:?}"
+    assert_eq!(
+        outcome_transport(&outcome),
+        Some(TransportKind::Quic),
+        "the first session must have run over QUIC: {outcome:?}"
     );
 
     // The second session against the same gateway is accepted.
@@ -77,12 +75,15 @@ async fn a_pinned_certificate_is_accepted_again() {
         .await
         .expect("the session must not hang")
         .expect("the client must not panic");
-    assert!(
-        matches!(
-            outcome,
-            SessionOutcome::Ended { .. } | SessionOutcome::Errored { .. }
-        ),
-        "the second session must have run: {outcome:?}"
+    assert_eq!(
+        outcome_transport(&outcome),
+        Some(TransportKind::Quic),
+        "the second session must have run over QUIC: {outcome:?}"
+    );
+    assert_eq!(
+        gateway.quic_connections(),
+        2,
+        "both sessions must have reached the gateway over QUIC"
     );
 
     // The pin file still holds exactly that one fingerprint.
@@ -179,12 +180,15 @@ async fn a_removed_fingerprint_lets_the_new_certificate_be_pinned() {
         .await
         .expect("the session must not hang")
         .expect("the client must not panic");
-    assert!(
-        matches!(
-            outcome,
-            SessionOutcome::Ended { .. } | SessionOutcome::Errored { .. }
-        ),
-        "the session must have run: {outcome:?}"
+    assert_eq!(
+        outcome_transport(&outcome),
+        Some(TransportKind::Quic),
+        "the session must have run over QUIC: {outcome:?}"
+    );
+    assert_eq!(
+        second.quic_connections(),
+        1,
+        "the tun must have reached the new gateway over QUIC"
     );
 
     let pins = PinStore::open(dir.path().join("tun.pins")).unwrap();
@@ -217,12 +221,15 @@ async fn the_pin_list_accepts_several_gateways() {
             .await
             .expect("the session must not hang")
             .expect("the client must not panic");
-        assert!(
-            matches!(
-                outcome,
-                SessionOutcome::Ended { .. } | SessionOutcome::Errored { .. }
-            ),
-            "the session must have run: {outcome:?}"
+        assert_eq!(
+            outcome_transport(&outcome),
+            Some(TransportKind::Quic),
+            "the session must have run over QUIC: {outcome:?}"
+        );
+        assert_eq!(
+            gateway.quic_connections(),
+            1,
+            "the tun must have reached the gateway over QUIC"
         );
     }
 }

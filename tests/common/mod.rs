@@ -191,12 +191,49 @@ pub struct Wired {
 
 impl Wired {
     /// End the session and wait for the client's outcome.
+    ///
+    /// The session's receipt comes with it: the gateway's counters say
+    /// which transport the session ran on, so a session that quietly
+    /// fell back cannot pass.
     pub async fn outcome(self) -> SessionOutcome {
         self.session.close();
-        tokio::time::timeout(DEADLINE, self.client)
+        let Self {
+            kind,
+            gateway,
+            client,
+            ..
+        } = self;
+        let outcome = tokio::time::timeout(DEADLINE, client)
             .await
             .expect("the session must not hang")
-            .expect("the client must not panic")
+            .expect("the client must not panic");
+        match kind {
+            TransportKind::Quic => {
+                assert_eq!(
+                    gateway.quic_connections(),
+                    1,
+                    "the tun must have opened exactly one QUIC connection"
+                );
+                assert_eq!(
+                    gateway.tcp_connections(),
+                    0,
+                    "the tun must not have opened a TCP connection"
+                );
+            }
+            TransportKind::Tcp => {
+                assert_eq!(
+                    gateway.tcp_connections(),
+                    1,
+                    "the tun must have opened exactly one TCP connection"
+                );
+                assert_eq!(
+                    gateway.quic_connections(),
+                    0,
+                    "the tun must not have contacted the QUIC endpoint"
+                );
+            }
+        }
+        outcome
     }
 }
 
@@ -283,10 +320,14 @@ impl Gateway {
                         let Some(incoming) = endpoint.accept().await else {
                             break;
                         };
+                        // The attempt is counted before the handshake
+                        // completes: a tun that reached the gateway and
+                        // was refused on trust did open a QUIC
+                        // connection.
+                        counted.quic_connections.fetch_add(1, Ordering::SeqCst);
                         let Ok(connection) = incoming.await else {
                             continue;
                         };
-                        counted.quic_connections.fetch_add(1, Ordering::SeqCst);
                         let auth = auth.clone();
                         let tx = quic_tx.clone();
                         tokio::spawn(async move {
@@ -382,7 +423,8 @@ async fn serve_quic(
     let Ok(line) = read_crlf_line(&mut control).await else {
         return;
     };
-    let parsed = decode_auth(line.as_bytes()).unwrap_or_default();
+    let parsed = decode_auth(line.as_bytes())
+        .unwrap_or_else(|e| panic!("the tun's AUTH line must parse: {e}: {line:?}"));
     match auth {
         AuthReply::Accept => {
             let _ = control

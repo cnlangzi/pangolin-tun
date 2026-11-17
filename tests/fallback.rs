@@ -41,6 +41,11 @@ async fn auto_runs_the_session_over_quic() {
         Some(TransportKind::Quic)
     );
     assert_eq!(
+        gateway.quic_connections(),
+        1,
+        "the tun must have opened exactly one QUIC connection"
+    );
+    assert_eq!(
         gateway.tcp_connections(),
         0,
         "the tun must not have opened a TCP connection"
@@ -74,6 +79,11 @@ async fn auto_falls_back_to_tcp_when_udp_does_not_answer() {
     assert_eq!(
         common::outcome_transport(&outcome),
         Some(TransportKind::Tcp)
+    );
+
+    assert!(
+        gateway.udp_datagrams() >= 1,
+        "the QUIC attempt must have reached the blackhole"
     );
 
     // The failure was recorded, so the next session skips the probe.
@@ -237,6 +247,11 @@ async fn an_untrusted_gateway_does_not_fall_back() {
         other => panic!("the session must not have been established: {other:?}"),
     }
     assert_eq!(
+        gateway.quic_connections(),
+        1,
+        "the tun must have reached the gateway over QUIC"
+    );
+    assert_eq!(
         gateway.tcp_connections(),
         0,
         "the bearer token must not have travelled in cleartext"
@@ -280,6 +295,11 @@ async fn a_refused_session_does_not_fall_back() {
         }
         other => panic!("the session must not have been established: {other:?}"),
     }
+    assert_eq!(
+        gateway.quic_connections(),
+        1,
+        "the tun must have reached the gateway over QUIC"
+    );
     assert_eq!(
         gateway.tcp_connections(),
         0,
