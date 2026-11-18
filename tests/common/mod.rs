@@ -257,9 +257,6 @@ struct Inner {
     udp_datagrams: Arc<AtomicUsize>,
     quic_sessions: tokio::sync::Mutex<mpsc::UnboundedReceiver<QuicSession>>,
     tcp_sessions: tokio::sync::Mutex<mpsc::UnboundedReceiver<TcpSession>>,
-    /// The QUIC endpoint has to outlive the connections it carries:
-    /// dropping it tears them down.
-    endpoint: Option<quinn::Endpoint>,
 }
 
 /// A test gateway: one address serving both transports.
@@ -275,6 +272,9 @@ pub struct Gateway {
     /// port is blackholed.
     pub fingerprint: String,
     inner: Arc<Inner>,
+    /// The QUIC endpoint has to outlive the connections it carries:
+    /// dropping it tears them down.
+    endpoint: Option<quinn::Endpoint>,
     /// The tasks that serve the gateway, so a test can stop it.
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -343,14 +343,25 @@ impl Gateway {
         let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let mut last_failure = String::new();
         for _ in 0..16 {
+            let mut failure: Option<String> = None;
             let listener = match wanted {
-                Some(addr) => TcpListener::bind(addr).await.unwrap(),
+                Some(addr) => match TcpListener::bind(addr).await {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        last_failure = e.to_string();
+                        // The address may still be held by the
+                        // listener that is closing: a gateway that
+                        // restarts takes its address back a moment
+                        // later.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                },
                 None => TcpListener::bind("127.0.0.1:0").await.unwrap(),
             };
             let port = listener.local_addr().unwrap().port();
             let addr = wanted.unwrap_or(SocketAddr::from(([127, 0, 0, 1], port)));
 
-            let mut failure: Option<String> = None;
             let endpoint = match quic {
                 QuicMode::Serve => match bind_endpoint(addr, &cert) {
                     Ok(endpoint) => Some(endpoint),
@@ -405,10 +416,9 @@ impl Gateway {
                 udp_datagrams: udp_datagrams.clone(),
                 quic_sessions: tokio::sync::Mutex::new(quic_rx),
                 tcp_sessions: tokio::sync::Mutex::new(tcp_rx),
-                endpoint: endpoint.clone(),
             });
 
-            if let Some(endpoint) = endpoint {
+            if let Some(endpoint) = endpoint.clone() {
                 let counted = Arc::clone(&inner);
                 tasks.push(tokio::spawn(async move {
                     loop {
@@ -454,6 +464,7 @@ impl Gateway {
                     QuicMode::Blackhole => String::new(),
                 },
                 inner,
+                endpoint,
                 tasks,
             };
         }
@@ -524,19 +535,26 @@ impl Gateway {
 
     /// Stop the gateway and wait for its tasks to end.
     ///
-    /// The address is free for a gateway that takes the gateway's
+    /// The gateway's address is free for a gateway that takes its
     /// place — the way a restarted gateway comes back on the same
-    /// port.
-    pub async fn stop(&mut self) {
-        if let Some(endpoint) = &self.inner.endpoint {
+    /// port: the tasks are aborted, the connections are closed and
+    /// the endpoint — with it the socket that held the address — is
+    /// dropped.
+    ///
+    /// A session the test still holds keeps the socket alive, so drop
+    /// it before stopping the gateway.
+    pub async fn stop(mut self) {
+        if let Some(endpoint) = &self.endpoint {
             endpoint.close(0u32.into(), b"stopped");
         }
         for task in self.tasks.drain(..) {
             task.abort();
             // Awaiting the aborted task waits for its future to be
-            // dropped — and with it the socket that held the address.
+            // dropped — and with it the listener that held the
+            // address.
             let _ = task.await;
         }
+        self.endpoint = None;
     }
 }
 

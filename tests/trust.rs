@@ -254,7 +254,7 @@ async fn a_gateway_that_restarts_with_the_same_certificate_is_accepted_again() {
     let (backend_port, _backend) = common::echo_backend().await;
     let dir = tempfile::tempdir().unwrap();
 
-    let mut gateway = Gateway::bind_at_with_cert(
+    let gateway = Gateway::bind_at_with_cert(
         addr,
         cert.clone(),
         QuicMode::Serve,
@@ -288,7 +288,6 @@ async fn a_gateway_that_restarts_with_the_same_certificate_is_accepted_again() {
 
     // The gateway goes away and comes back with the same certificate.
     gateway.stop().await;
-    drop(gateway);
     let gateway = Gateway::bind_at_with_cert(
         addr,
         cert.clone(),
@@ -331,14 +330,21 @@ async fn a_gateway_that_restarts_with_the_same_certificate_is_accepted_again() {
 /// fingerprint in either case.
 #[tokio::test]
 async fn a_pin_file_with_comments_and_upper_case_hex_is_accepted() {
-    let gateway = Gateway::bind(QuicMode::Serve, AuthReply::Accept, UpgradeReply::Accept).await;
+    let cert = QuicCert::generate().unwrap();
+    let gateway = Gateway::bind_with_cert(
+        cert.clone(),
+        QuicMode::Serve,
+        AuthReply::Accept,
+        UpgradeReply::Accept,
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let pin_path = dir.path().join("tun.pins");
     std::fs::write(
         &pin_path,
         format!(
             "# the gateway's certificate\n\n{}\n",
-            gateway.fingerprint.to_ascii_uppercase()
+            cert.fingerprint.to_ascii_uppercase()
         ),
     )
     .unwrap();
@@ -361,5 +367,5 @@ async fn a_pin_file_with_comments_and_upper_case_hex_is_accepted() {
 
     // The store holds the fingerprint in lower case.
     let pins = PinStore::open(&pin_path).unwrap();
-    assert_eq!(pins.pins(), vec![gateway.fingerprint.to_ascii_lowercase()]);
+    assert_eq!(pins.pins(), vec![cert.fingerprint.to_ascii_lowercase()]);
 }

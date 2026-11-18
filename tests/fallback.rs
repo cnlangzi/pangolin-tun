@@ -9,8 +9,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{
-    AuthReply, DEADLINE, Gateway, QuicMode, TOKEN, UpgradeReply, client, client_at, connect_to,
-    echo_backend, round_trip, unix_now,
+    AuthReply, DEADLINE, Gateway, LONG_DEADLINE, QuicMode, TOKEN, UpgradeReply, client, client_at,
+    connect_to, echo_backend, round_trip, unix_now,
 };
 use pangolin_tun::client::QUIC_PROBE_SKIP_SECS;
 use pangolin_tun::{Error, SessionOutcome, TransportKind, TransportSelector, TunSettings};
@@ -65,7 +65,9 @@ async fn auto_falls_back_to_tcp_when_udp_does_not_answer() {
 
     let started = Instant::now();
     let task = tokio::spawn(async move { client.connect_once().await });
-    let session = tokio::time::timeout(DEADLINE, gateway.accept_tcp())
+    // The wait is longer than the bound below, so the bound is what
+    // reports a fallback that took too long.
+    let session = tokio::time::timeout(LONG_DEADLINE, gateway.accept_tcp())
         .await
         .expect("the gateway must not hang")
         .into_session();
