@@ -132,6 +132,54 @@ async fn a_response_that_arrives_after_the_request_ended_still_comes_through() {
     .await;
 }
 
+/// The backend ends its response direction, and the bytes the
+/// gateway writes after the answer still reach it.
+///
+/// The request direction is a separate half of the splice: a backend
+/// that answered and hung up must not cost the gateway the bytes it
+/// still had to send.
+#[tokio::test]
+async fn the_request_direction_stays_open_after_the_backend_ended_its_response() {
+    each_transport(|wired| async move {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (port, _backend) = backend(move |mut stream| {
+            let tx = tx.clone();
+            async move {
+                // The backend answers, ends its response direction and
+                // keeps reading.
+                stream.write_all(b"pong").await.unwrap();
+                stream.flush().await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut rest = Vec::new();
+                stream.read_to_end(&mut rest).await.unwrap();
+                let _ = tx.send(rest);
+            }
+        })
+        .await;
+
+        let mut stream = connect_to(&wired.session, "127.0.0.1", port).await;
+        // The gateway reads the answer.
+        let mut answer = vec![0u8; 4];
+        stream.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"pong");
+
+        // ... and then writes what it still had to say.
+        stream.write_all(b"more").await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let received = common::received(&mut rx).await;
+        assert_eq!(
+            received, b"more",
+            "the bytes written after the answer must reach the backend over {}",
+            wired.kind
+        );
+
+        wired.outcome().await;
+    })
+    .await;
+}
+
 /// One mebibyte travels in each direction and arrives intact.
 #[tokio::test]
 async fn a_large_payload_survives_the_tunnel() {

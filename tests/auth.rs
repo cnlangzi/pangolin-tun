@@ -337,3 +337,31 @@ async fn a_gateway_that_never_answers_the_upgrade_does_not_stick_the_client() {
     run.abort();
     let _ = run.await;
 }
+
+/// A gateway that answers the upgrade with a `101` and a wrong
+/// `Sec-WebSocket-Accept` is refused: the tun cannot tell whether it
+/// is talking to the gateway it asked for.
+#[tokio::test]
+async fn a_gateway_that_answers_with_a_wrong_accept_is_refused() {
+    let gateway = Gateway::bind(QuicMode::Serve, AuthReply::Accept, UpgradeReply::BadAccept).await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = client(dir.path(), &gateway, TransportSelector::Tcp);
+
+    let outcome = tokio::time::timeout(DEADLINE, client.connect_once())
+        .await
+        .expect("the connect attempt must not hang");
+
+    match outcome {
+        SessionOutcome::NotConnected { transport, error } => {
+            assert_eq!(transport, Some(TransportKind::Tcp));
+            let Error::Refused(message) = error else {
+                panic!("the gateway must have refused the upgrade: {error}");
+            };
+            assert!(
+                message.contains("Sec-WebSocket-Accept"),
+                "the message must name what was wrong: {message}"
+            );
+        }
+        other => panic!("the session must not have been established: {other:?}"),
+    }
+}

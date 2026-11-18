@@ -82,19 +82,23 @@ them is tried — the resolver's order is OS-dependent, and a gateway whose
 first address does not answer must not cost a fallback to the unencrypted
 transport. When the attempt fails:
 
-- **the gateway could not be reached** — UDP is blocked, the address is
-  wrong, the handshake timed out — the client falls back to the WebSocket/TCP
-  transport, records the time of the failure and skips the QUIC probe for the
-  next **10 minutes**. A network that blocks UDP therefore does not pay the
-  handshake timeout on every reconnect.
-- **the gateway could not be trusted** — its certificate is not the one the
-  client pinned — the client does **not** fall back. The fallback is
-  unencrypted, so falling back would hand the bearer token to whoever is
-  presenting the wrong certificate.
-- **the gateway refused the session** — a bad token, a protocol version
-  mismatch, or a session that did not come up after the handshake — the
-  client does **not** fall back either. The gateway was reached, and the
-  fallback carries the same token in cleartext, for no gain.
+- **nothing answered** — UDP is blocked, the address is wrong, the handshake
+  timed out — the client falls back to the WebSocket/TCP transport, records
+  the time of the failure and skips the QUIC probe for the next **10
+  minutes**. A network that blocks UDP therefore does not pay the handshake
+  timeout on every reconnect.
+- **the certificate is not trusted** — it is not the one the client pinned —
+  the client does **not** fall back. The fallback is unencrypted, so falling
+  back would hand the bearer token to whoever is presenting the wrong
+  certificate.
+- **the session was refused** — a bad token, a protocol version mismatch, or
+  a session that did not come up after the handshake — the client does
+  **not** fall back either. The gateway was reached, and the fallback carries
+  the same token in cleartext, for no gain.
+- **the peer answered QUIC but refused our protocol** — a TLS alert, or a
+  peer that speaks another QUIC version — the client does **not** fall back.
+  The peer is not a tunnel gateway, and the fallback would hand the bearer
+  token in cleartext to a host that just proved it is not one.
 
 A client that is pinned to one transport never attempts the other.
 

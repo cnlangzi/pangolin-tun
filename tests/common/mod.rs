@@ -20,8 +20,9 @@ use pangolin_tun::{
     QuicCert, QuicServerTransport, Result, SessionOutcome, TUNNEL_PROTOCOL_VERSION, TransportKind,
     TransportSelector, TunSettings, TunnelClient, TunnelRole, TunnelStream, TunnelTransport,
     WsRole, WsUpgradeRequest, YamuxTunnel, bind_endpoint, decode_auth, encode_auth_reply,
-    encode_connect, read_crlf_line, read_ws_upgrade_request, tunnel_over_websocket, wrap_websocket,
-    write_http_error, write_ws_accept_response,
+    encode_connect, install_crypto_provider, read_crlf_line, read_ws_upgrade_request,
+    transport_config, tunnel_over_websocket, wrap_websocket, write_http_error,
+    write_ws_accept_response,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -45,6 +46,9 @@ pub const NAME: &str = "office";
 pub enum QuicMode {
     /// A real QUIC endpoint with a self-signed certificate.
     Serve,
+    /// A QUIC endpoint that speaks another ALPN: a host that answers
+    /// QUIC but is not a tunnel gateway.
+    Foreign,
     /// A UDP socket that swallows every datagram: a network that
     /// blocks UDP.
     Blackhole,
@@ -69,6 +73,8 @@ pub enum AuthReply {
 pub enum UpgradeReply {
     /// `101 Switching Protocols`, then the yamux tunnel.
     Accept,
+    /// `101 Switching Protocols` with a wrong `Sec-WebSocket-Accept`.
+    BadAccept,
     /// An HTTP error, e.g. `401 Unauthorized`.
     Refuse { status: u16, reason: String },
     /// Nothing at all: the gateway accepts the connection and stays
@@ -251,9 +257,6 @@ struct Inner {
     udp_datagrams: Arc<AtomicUsize>,
     quic_sessions: tokio::sync::Mutex<mpsc::UnboundedReceiver<QuicSession>>,
     tcp_sessions: tokio::sync::Mutex<mpsc::UnboundedReceiver<TcpSession>>,
-    /// The QUIC endpoint has to outlive the connections it carries:
-    /// dropping it tears them down.
-    endpoint: Option<quinn::Endpoint>,
 }
 
 /// A test gateway: one address serving both transports.
@@ -269,6 +272,11 @@ pub struct Gateway {
     /// port is blackholed.
     pub fingerprint: String,
     inner: Arc<Inner>,
+    /// The QUIC endpoint has to outlive the connections it carries:
+    /// dropping it tears them down.
+    endpoint: Option<quinn::Endpoint>,
+    /// The tasks that serve the gateway, so a test can stop it.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Gateway {
@@ -279,17 +287,95 @@ impl Gateway {
     /// spaces, so the pair almost always fits; when it does not, the
     /// bind is retried with a fresh TCP port.
     pub async fn bind(quic: QuicMode, auth: AuthReply, upgrade: UpgradeReply) -> Gateway {
-        let cert = QuicCert::generate().unwrap();
+        Self::bind_inner(None, None, quic, auth, upgrade).await
+    }
+
+    /// Bind a gateway on a chosen address.
+    ///
+    /// The TCP listener takes the address and the UDP half is bound on
+    /// the same port number — so a client that falls back opens a TCP
+    /// connection to the very address its QUIC attempt went to.
+    pub async fn bind_at(
+        addr: SocketAddr,
+        quic: QuicMode,
+        auth: AuthReply,
+        upgrade: UpgradeReply,
+    ) -> Gateway {
+        Self::bind_inner(Some(addr), None, quic, auth, upgrade).await
+    }
+
+    /// Bind a gateway that serves a given certificate.
+    ///
+    /// A gateway that restarts comes back with the certificate it had
+    /// before, and a tun that pinned that fingerprint trusts it again.
+    pub async fn bind_with_cert(
+        cert: QuicCert,
+        quic: QuicMode,
+        auth: AuthReply,
+        upgrade: UpgradeReply,
+    ) -> Gateway {
+        Self::bind_inner(None, Some(cert), quic, auth, upgrade).await
+    }
+
+    /// Bind a gateway on a chosen address that serves a given
+    /// certificate — a gateway that restarts where it was.
+    pub async fn bind_at_with_cert(
+        addr: SocketAddr,
+        cert: QuicCert,
+        quic: QuicMode,
+        auth: AuthReply,
+        upgrade: UpgradeReply,
+    ) -> Gateway {
+        Self::bind_inner(Some(addr), Some(cert), quic, auth, upgrade).await
+    }
+
+    /// The common part of the constructors: the gateway's certificate,
+    /// its address and the two halves it serves.
+    async fn bind_inner(
+        wanted: Option<SocketAddr>,
+        cert: Option<QuicCert>,
+        quic: QuicMode,
+        auth: AuthReply,
+        upgrade: UpgradeReply,
+    ) -> Gateway {
+        let cert = cert.unwrap_or_else(|| QuicCert::generate().unwrap());
         let udp_datagrams = Arc::new(AtomicUsize::new(0));
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut last_failure = String::new();
         for _ in 0..16 {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut failure: Option<String> = None;
+            let listener = match wanted {
+                Some(addr) => match TcpListener::bind(addr).await {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        last_failure = e.to_string();
+                        // The address may still be held by the
+                        // listener that is closing: a gateway that
+                        // restarts takes its address back a moment
+                        // later.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                },
+                None => TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            };
             let port = listener.local_addr().unwrap().port();
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let addr = wanted.unwrap_or(SocketAddr::from(([127, 0, 0, 1], port)));
 
             let endpoint = match quic {
                 QuicMode::Serve => match bind_endpoint(addr, &cert) {
                     Ok(endpoint) => Some(endpoint),
-                    Err(_) => continue,
+                    Err(e) => {
+                        failure = Some(e.to_string());
+                        None
+                    }
+                },
+                QuicMode::Foreign => match bind_foreign_endpoint(addr, &cert) {
+                    Ok(endpoint) => Some(endpoint),
+                    Err(e) => {
+                        failure = Some(e.to_string());
+                        None
+                    }
                 },
                 QuicMode::Blackhole => match UdpSocket::bind(addr).await {
                     Ok(socket) => {
@@ -305,9 +391,22 @@ impl Gateway {
                         });
                         None
                     }
-                    Err(_) => continue,
+                    Err(e) => {
+                        failure = Some(e.to_string());
+                        None
+                    }
                 },
             };
+            if let Some(reason) = failure {
+                last_failure = reason;
+                if wanted.is_some() {
+                    // The address may still be held by the socket
+                    // that is closing: a gateway that restarts takes
+                    // its address back a moment later.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                continue;
+            }
 
             let (quic_tx, quic_rx) = mpsc::unbounded_channel();
             let (tcp_tx, tcp_rx) = mpsc::unbounded_channel();
@@ -317,12 +416,11 @@ impl Gateway {
                 udp_datagrams: udp_datagrams.clone(),
                 quic_sessions: tokio::sync::Mutex::new(quic_rx),
                 tcp_sessions: tokio::sync::Mutex::new(tcp_rx),
-                endpoint: endpoint.clone(),
             });
 
-            if let Some(endpoint) = endpoint {
+            if let Some(endpoint) = endpoint.clone() {
                 let counted = Arc::clone(&inner);
-                tokio::spawn(async move {
+                tasks.push(tokio::spawn(async move {
                     loop {
                         let Some(incoming) = endpoint.accept().await else {
                             break;
@@ -341,11 +439,11 @@ impl Gateway {
                             serve_quic(connection, auth, tx).await;
                         });
                     }
-                });
+                }));
             }
 
             let counted = Arc::clone(&inner);
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
                         break;
@@ -357,18 +455,20 @@ impl Gateway {
                         serve_tcp(stream, upgrade, tx).await;
                     });
                 }
-            });
+            }));
 
             return Gateway {
                 addr: addr.to_string(),
                 fingerprint: match quic {
-                    QuicMode::Serve => cert.fingerprint.clone(),
+                    QuicMode::Serve | QuicMode::Foreign => cert.fingerprint.clone(),
                     QuicMode::Blackhole => String::new(),
                 },
                 inner,
+                endpoint,
+                tasks,
             };
         }
-        panic!("no port number carried both transports");
+        panic!("the gateway could not be bound: {last_failure}");
     }
 
     /// The number of QUIC connections the gateway accepted.
@@ -414,6 +514,80 @@ impl Gateway {
             TransportKind::Tcp => Session::Tcp(self.accept_tcp().await),
         }
     }
+
+    /// Accept the tun's session on whichever transport it chose.
+    ///
+    /// A session that fell back is indistinguishable from a QUIC one
+    /// for a test that does not care — and the client's transport
+    /// choice is not always the test's to make.
+    pub async fn accept_any(&self) -> Session {
+        let mut quic = self.inner.quic_sessions.lock().await;
+        let mut tcp = self.inner.tcp_sessions.lock().await;
+        tokio::select! {
+            session = quic.recv() => {
+                Session::Quic(session.expect("the gateway accepted no QUIC session"))
+            }
+            session = tcp.recv() => {
+                Session::Tcp(session.expect("the gateway accepted no WebSocket session"))
+            }
+        }
+    }
+
+    /// Stop the gateway and wait for its tasks to end.
+    ///
+    /// The gateway's address is free for a gateway that takes its
+    /// place — the way a restarted gateway comes back on the same
+    /// port: the tasks are aborted, the connections are closed and
+    /// the endpoint — with it the socket that held the address — is
+    /// dropped.
+    ///
+    /// A session the test still holds keeps the socket alive, so drop
+    /// it before stopping the gateway.
+    pub async fn stop(mut self) {
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.close(0u32.into(), b"stopped");
+        }
+        for task in self.tasks.drain(..) {
+            task.abort();
+            // Awaiting the aborted task waits for its future to be
+            // dropped — and with it the listener that held the
+            // address.
+            let _ = task.await;
+        }
+        self.endpoint = None;
+    }
+}
+
+/// Bind a QUIC endpoint that speaks another ALPN.
+///
+/// The crate's `bind_endpoint` hardcodes the tunnel's ALPN, so the
+/// harness builds its own: a host that answers QUIC but is not a
+/// tunnel gateway.
+fn bind_foreign_endpoint(addr: SocketAddr, cert: &QuicCert) -> Result<quinn::Endpoint> {
+    install_crypto_provider();
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert_der.clone());
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_der.clone()),
+    );
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| pangolin_tun::Error::Invalid(format!("tls protocol versions: {e}")))?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .map_err(|e| {
+            pangolin_tun::Error::Invalid(format!("the tunnel certificate is not usable: {e}"))
+        })?;
+    server_config.alpn_protocols = vec![b"not-a-tunnel/1".to_vec()];
+    let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
+        .map_err(|e| pangolin_tun::Error::Invalid(format!("quic server config: {e}")))?;
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+    config.transport_config(Arc::new(transport_config()));
+    quinn::Endpoint::server(config, addr).map_err(|e| {
+        pangolin_tun::Error::Io(std::io::Error::other(format!(
+            "bind the quic endpoint: {e}"
+        )))
+    })
 }
 
 /// Serve one QUIC session: read the AUTH line on the control stream
@@ -485,6 +659,23 @@ async fn serve_tcp(
                 stream: None,
             });
         }
+        UpgradeReply::BadAccept => {
+            // A `101` with an accept value the client cannot have
+            // derived: the tun must refuse the upgrade.
+            let resp = "HTTP/1.1 101 Switching Protocols\r\n\
+                        Upgrade: websocket\r\n\
+                        Connection: Upgrade\r\n\
+                        Sec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\
+                        \r\n";
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
+            let _ = tx.send(TcpSession {
+                upgrade: request,
+                tunnel: None,
+                stream: None,
+            });
+        }
         UpgradeReply::Refuse { status, reason } => {
             let _ = write_http_error(&mut stream, status, &reason).await;
             let _ = stream.shutdown().await;
@@ -520,8 +711,22 @@ where
     F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    backend_at("127.0.0.1:0", handle)
+        .await
+        .expect("bind the backend")
+}
+
+/// A backend bound on a given address.
+///
+/// The address may be an IPv6 literal (`[::1]:0`) — the returned port
+/// is the one the kernel picked.
+pub async fn backend_at<F, Fut>(addr: &str, handle: F) -> Result<(u16, tokio::task::JoinHandle<()>)>
+where
+    F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = TcpListener::bind(addr).await?;
+    let port = listener.local_addr()?.port();
     let handle = Arc::new(handle);
     let task = tokio::spawn(async move {
         loop {
@@ -532,7 +737,7 @@ where
             tokio::spawn(async move { handle(stream).await });
         }
     });
-    (port, task)
+    Ok((port, task))
 }
 
 /// A backend that echoes every byte it receives.
@@ -639,18 +844,27 @@ where
 
 /// Open a stream to the tun and write the CONNECT instruction.
 pub async fn open_stream(session: &Session, host: &str, port: u16) -> TunnelStream {
+    open_raw_stream(session, &encode_connect(host, port)).await
+}
+
+/// Open a stream to the tun and write the given bytes verbatim.
+///
+/// A test uses it to send an instruction the codec would never
+/// produce — a malformed one, or one that is longer than the line
+/// bound.
+pub async fn open_raw_stream(session: &Session, bytes: &[u8]) -> TunnelStream {
     let mut stream = tokio::time::timeout(DEADLINE, session.open_stream())
         .await
         .expect("the stream must not hang")
         .expect("open the stream");
-    tokio::time::timeout(DEADLINE, stream.write_all(&encode_connect(host, port)))
+    tokio::time::timeout(DEADLINE, stream.write_all(bytes))
         .await
-        .expect("the CONNECT instruction must not hang")
-        .expect("write the CONNECT instruction");
+        .expect("the instruction must not hang")
+        .expect("write the instruction");
     tokio::time::timeout(DEADLINE, stream.flush())
         .await
-        .expect("the CONNECT instruction must not hang")
-        .expect("flush the CONNECT instruction");
+        .expect("the instruction must not hang")
+        .expect("flush the instruction");
     stream
 }
 

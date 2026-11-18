@@ -236,14 +236,40 @@ pub fn decode_connect(line: &[u8]) -> Result<(String, u16)> {
 ///
 /// The reason is one line: CR and LF are replaced with a space, so a
 /// reason can never smuggle a second line into the gateway's stream.
+/// It is bounded as well — the reply is a protocol line, and a reason
+/// that quotes the instruction it is about would push it past the
+/// line limit.
 pub fn encode_connect_reply(result: std::result::Result<(), &str>) -> Vec<u8> {
     match result {
         Ok(()) => b"OK\r\n".to_vec(),
         Err(reason) => {
-            let reason = reason.replace(['\r', '\n'], " ");
+            let reason = bounded_reason(reason);
             format!("ERR {reason}\r\n").into_bytes()
         }
     }
+}
+
+/// The reason of an `ERR` reply, on one line and within the line
+/// limit.
+///
+/// The reason can quote the instruction it is about — and the
+/// instruction is a protocol line itself, so the reply has to be
+/// bounded: the peer's line reader would refuse a longer one.
+fn bounded_reason(reason: &str) -> String {
+    // The "ERR " prefix and the CRLF terminator count against the
+    // limit, and the ellipsis that marks a cut reason takes three
+    // more.
+    const LIMIT: usize = MAX_INSTRUCTION_LEN - "ERR ".len() - 2;
+    const MARKER: &str = "...";
+    let reason = reason.replace(['\r', '\n'], " ");
+    if reason.len() <= LIMIT {
+        return reason;
+    }
+    let mut end = LIMIT - MARKER.len();
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &reason[..end])
 }
 
 /// Decode the tun's answer to a `CONNECT` instruction.
@@ -501,7 +527,8 @@ where
 ///
 /// A target that cannot be reached is answered with `ERR <reason>` and
 /// the stream is closed — the gateway turns that into a 502 for the
-/// client.
+/// client. So is an instruction that cannot be decoded: the line was
+/// read, so the reason can be answered with it.
 pub async fn serve_tunnel_stream<S, F, Fut, B>(mut stream: S, mut dial: F) -> Result<()>
 where
     S: TunnelByteStream,
@@ -512,17 +539,20 @@ where
     let line = read_crlf_line(&mut stream)
         .await
         .map_err(|e| e.with_context("read the CONNECT instruction"))?;
-    let (host, port) =
-        decode_connect(line.as_bytes()).map_err(|e| e.with_context("bad CONNECT instruction"))?;
+    let (host, port) = match decode_connect(line.as_bytes()) {
+        Ok(target) => target,
+        Err(e) => {
+            // The instruction is malformed: the target is not even
+            // known.
+            refuse(&mut stream, &e.reason()).await?;
+            return Ok(());
+        }
+    };
 
     let backend = match dial(&host, port).await {
         Ok(backend) => backend,
         Err(e) => {
-            let reason = e.reason();
-            stream
-                .write_all(&encode_connect_reply(Err(&reason)))
-                .await?;
-            stream.flush().await?;
+            refuse(&mut stream, &e.reason()).await?;
             return Ok(());
         }
     };
@@ -532,6 +562,17 @@ where
 
     let mut backend = backend;
     relay_bidirectional(&mut stream, &mut backend).await
+}
+
+/// Answer a request with `ERR <reason>`.
+///
+/// The reason is one line and within the line limit, so the answer
+/// cannot smuggle a second line into the peer's stream — and the
+/// peer's line reader accepts it.
+async fn refuse<S: TunnelByteStream>(stream: &mut S, reason: &str) -> Result<()> {
+    stream.write_all(&encode_connect_reply(Err(reason))).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -636,11 +677,58 @@ mod tests {
         );
     }
 
+    /// The reply is a protocol line: a reason that quotes the
+    /// instruction it is about must not push it past the line limit,
+    /// or the peer's line reader would refuse it.
+    #[test]
+    fn the_err_reply_stays_within_the_line_limit() {
+        let reason = "x".repeat(MAX_INSTRUCTION_LEN * 2);
+        let bytes = encode_connect_reply(Err(&reason));
+        assert!(
+            bytes.len() <= MAX_INSTRUCTION_LEN,
+            "the reply must fit the line limit: {} bytes",
+            bytes.len()
+        );
+        assert_eq!(
+            bytes.iter().filter(|b| **b == b'\n').count(),
+            1,
+            "the reply must not contain a second line"
+        );
+    }
+
     /// An unknown reply is a protocol error, not a silent success.
     #[test]
     fn connect_reply_with_unknown_verb_is_refused() {
         let err = decode_connect_reply(b"MAYBE\r\n").unwrap_err();
         assert!(matches!(err, TunnelError::Protocol(_)), "{err}");
+    }
+
+    /// A malformed CONNECT instruction is refused with a reason: the
+    /// gateway turns the `ERR` into a 502, and the reason names what
+    /// was wrong with the instruction.
+    #[tokio::test]
+    async fn a_malformed_connect_instruction_is_answered_with_err() {
+        let (mut gateway, tunnel) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            let dial =
+                |_host: &str, _port: u16| async { Ok::<_, TunnelError>(tokio::io::duplex(8).0) };
+            serve_tunnel_stream(tunnel, dial).await
+        });
+
+        gateway
+            .write_all(b"CONNECT <invalid-host>\r\n")
+            .await
+            .unwrap();
+        gateway.flush().await.unwrap();
+
+        let reply = read_crlf_line(&mut gateway).await.unwrap();
+        assert!(reply.starts_with("ERR "), "the tun must refuse it: {reply}");
+        // The reply is the last thing on the stream: the reason
+        // cannot have smuggled a second line behind it.
+        let mut rest = Vec::new();
+        gateway.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "nothing may follow the reply: {rest:?}");
+        relay.await.unwrap().unwrap();
     }
 
     // -------------------------------------------------------------------

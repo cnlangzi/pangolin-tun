@@ -40,3 +40,32 @@ async fn a_session_over_quic_relays_the_bytes() {
         other => panic!("the session must have run over QUIC: {other:?}"),
     }
 }
+
+/// The client serves a first session, the gateway closes it, and the
+/// client comes back for a second one — and that session carries a
+/// request.
+#[tokio::test]
+async fn the_client_reconnects_after_the_gateway_closes_the_quic_session() {
+    let gateway = Gateway::bind(QuicMode::Serve, AuthReply::Accept, UpgradeReply::Accept).await;
+    let (backend_port, _backend) = echo_backend().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = client(dir.path(), &gateway, TransportSelector::Quic);
+
+    let run = tokio::spawn(async move { client.run().await });
+
+    let first = tokio::time::timeout(DEADLINE, gateway.accept_quic())
+        .await
+        .expect("the first session must come up");
+    // The gateway closes the session.
+    first.close();
+
+    let second = tokio::time::timeout(DEADLINE, gateway.accept_quic())
+        .await
+        .expect("the client must come back for a second session");
+
+    let mut stream = connect_to(&second.into_session(), "127.0.0.1", backend_port).await;
+    let echoed = round_trip(&mut stream, b"ping").await;
+    assert_eq!(echoed, b"ping");
+
+    run.abort();
+}
