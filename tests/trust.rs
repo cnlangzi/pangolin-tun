@@ -7,8 +7,10 @@ mod common;
 
 use common::{AuthReply, DEADLINE, Gateway, QuicMode, UpgradeReply, client, outcome_transport};
 use pangolin_tun::{
-    Error, PinStore, QuicClientTransport, SessionOutcome, TransportKind, TransportSelector,
+    Error, PinStore, QuicCert, QuicClientTransport, SessionOutcome, TransportKind,
+    TransportSelector,
 };
+use tokio::net::TcpListener;
 
 /// The first contact pins the gateway's certificate.
 #[tokio::test]
@@ -232,4 +234,132 @@ async fn the_pin_list_accepts_several_gateways() {
             "the tun must have reached the gateway over QUIC"
         );
     }
+}
+
+/// A gateway that restarts with the certificate it had before is
+/// trusted again.
+///
+/// The tun pins a fingerprint, not a certificate request: a gateway
+/// that comes back with the certificate it had before is the gateway
+/// the tun pinned, and the pin file still holds exactly that one
+/// fingerprint.
+#[tokio::test]
+async fn a_gateway_that_restarts_with_the_same_certificate_is_accepted_again() {
+    // The address the gateway serves, and the certificate it serves.
+    let cert = QuicCert::generate().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let (backend_port, _backend) = common::echo_backend().await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut gateway = Gateway::bind_at_with_cert(
+        addr,
+        cert.clone(),
+        QuicMode::Serve,
+        AuthReply::Accept,
+        UpgradeReply::Accept,
+    )
+    .await;
+    let tun = client(dir.path(), &gateway, TransportSelector::Quic);
+
+    let task = tokio::spawn(async move { tun.connect_once().await });
+    let session = tokio::time::timeout(DEADLINE, gateway.accept_quic())
+        .await
+        .expect("the gateway must not hang");
+    session.close();
+    // The session is dropped: it holds the connection, and the
+    // connection holds the socket that serves the address.
+    drop(session);
+    let outcome = tokio::time::timeout(DEADLINE, task)
+        .await
+        .expect("the session must not hang")
+        .expect("the client must not panic");
+    assert_eq!(
+        outcome_transport(&outcome),
+        Some(TransportKind::Quic),
+        "the first session must have run over QUIC: {outcome:?}"
+    );
+
+    // The certificate is pinned.
+    let pins = PinStore::open(dir.path().join("tun.pins")).unwrap();
+    assert_eq!(pins.pins(), vec![cert.fingerprint.clone()]);
+
+    // The gateway goes away and comes back with the same certificate.
+    gateway.stop().await;
+    drop(gateway);
+    let gateway = Gateway::bind_at_with_cert(
+        addr,
+        cert.clone(),
+        QuicMode::Serve,
+        AuthReply::Accept,
+        UpgradeReply::Accept,
+    )
+    .await;
+
+    let tun = client(dir.path(), &gateway, TransportSelector::Quic);
+    let task = tokio::spawn(async move { tun.connect_once().await });
+    let session = tokio::time::timeout(DEADLINE, gateway.accept_quic())
+        .await
+        .expect("the gateway must not hang")
+        .into_session();
+
+    let mut stream = common::connect_to(&session, "127.0.0.1", backend_port).await;
+    let echoed = common::round_trip(&mut stream, b"ping").await;
+    assert_eq!(echoed, b"ping");
+
+    session.close();
+    let outcome = tokio::time::timeout(DEADLINE, task)
+        .await
+        .expect("the session must not hang")
+        .expect("the client must not panic");
+    assert_eq!(
+        outcome_transport(&outcome),
+        Some(TransportKind::Quic),
+        "the second session must have run over QUIC: {outcome:?}"
+    );
+
+    // The pin file still holds exactly that one fingerprint: the
+    // restart did not ask for a new pin.
+    let pins = PinStore::open(dir.path().join("tun.pins")).unwrap();
+    assert_eq!(pins.pins(), vec![cert.fingerprint.clone()]);
+}
+
+/// A pin file with comment lines, blank lines and upper-case hex is
+/// accepted: an operator may annotate the file and write the
+/// fingerprint in either case.
+#[tokio::test]
+async fn a_pin_file_with_comments_and_upper_case_hex_is_accepted() {
+    let gateway = Gateway::bind(QuicMode::Serve, AuthReply::Accept, UpgradeReply::Accept).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pin_path = dir.path().join("tun.pins");
+    std::fs::write(
+        &pin_path,
+        format!(
+            "# the gateway's certificate\n\n{}\n",
+            gateway.fingerprint.to_ascii_uppercase()
+        ),
+    )
+    .unwrap();
+
+    let tun = client(dir.path(), &gateway, TransportSelector::Quic);
+    let task = tokio::spawn(async move { tun.connect_once().await });
+    let session = tokio::time::timeout(DEADLINE, gateway.accept_quic())
+        .await
+        .expect("the gateway must not hang");
+    session.close();
+    let outcome = tokio::time::timeout(DEADLINE, task)
+        .await
+        .expect("the session must not hang")
+        .expect("the client must not panic");
+    assert_eq!(
+        outcome_transport(&outcome),
+        Some(TransportKind::Quic),
+        "the session must have run over QUIC: {outcome:?}"
+    );
+
+    // The store holds the fingerprint in lower case.
+    let pins = PinStore::open(&pin_path).unwrap();
+    assert_eq!(pins.pins(), vec![gateway.fingerprint.to_ascii_lowercase()]);
 }

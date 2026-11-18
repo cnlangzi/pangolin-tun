@@ -501,7 +501,8 @@ where
 ///
 /// A target that cannot be reached is answered with `ERR <reason>` and
 /// the stream is closed — the gateway turns that into a 502 for the
-/// client.
+/// client. So is an instruction that cannot be decoded: the line was
+/// read, so the reason can be answered with it.
 pub async fn serve_tunnel_stream<S, F, Fut, B>(mut stream: S, mut dial: F) -> Result<()>
 where
     S: TunnelByteStream,
@@ -512,8 +513,20 @@ where
     let line = read_crlf_line(&mut stream)
         .await
         .map_err(|e| e.with_context("read the CONNECT instruction"))?;
-    let (host, port) =
-        decode_connect(line.as_bytes()).map_err(|e| e.with_context("bad CONNECT instruction"))?;
+    let (host, port) = match decode_connect(line.as_bytes()) {
+        Ok(target) => target,
+        Err(e) => {
+            // The instruction is malformed: the target is not even
+            // known. The reason is one line, so the answer cannot
+            // smuggle a second line into the gateway's stream.
+            let reason = e.reason();
+            stream
+                .write_all(&encode_connect_reply(Err(&reason)))
+                .await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+    };
 
     let backend = match dial(&host, port).await {
         Ok(backend) => backend,
@@ -641,6 +654,33 @@ mod tests {
     fn connect_reply_with_unknown_verb_is_refused() {
         let err = decode_connect_reply(b"MAYBE\r\n").unwrap_err();
         assert!(matches!(err, TunnelError::Protocol(_)), "{err}");
+    }
+
+    /// A malformed CONNECT instruction is refused with a reason: the
+    /// gateway turns the `ERR` into a 502, and the reason names what
+    /// was wrong with the instruction.
+    #[tokio::test]
+    async fn a_malformed_connect_instruction_is_answered_with_err() {
+        let (mut gateway, tunnel) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            let dial =
+                |_host: &str, _port: u16| async { Ok::<_, TunnelError>(tokio::io::duplex(8).0) };
+            serve_tunnel_stream(tunnel, dial).await
+        });
+
+        gateway
+            .write_all(b"CONNECT <invalid-host>\r\n")
+            .await
+            .unwrap();
+        gateway.flush().await.unwrap();
+
+        let reply = read_crlf_line(&mut gateway).await.unwrap();
+        assert!(reply.starts_with("ERR "), "the tun must refuse it: {reply}");
+        assert!(
+            !reply.contains('\r') && !reply.contains('\n'),
+            "the reason must be one line: {reply:?}"
+        );
+        relay.await.unwrap().unwrap();
     }
 
     // -------------------------------------------------------------------

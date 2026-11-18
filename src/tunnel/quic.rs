@@ -325,7 +325,8 @@ pub enum QuicConnectError {
     /// wrong certificate.
     Untrusted(String),
     /// The gateway refused the session — a bad token, a protocol
-    /// version mismatch — or the session did not come up after the
+    /// version mismatch, a peer that answered QUIC but refused our
+    /// protocol — or the session did not come up after the
     /// handshake. The tun MUST NOT fall back either: the gateway was
     /// reached, and the fallback carries the same token in cleartext.
     Refused(String),
@@ -377,6 +378,47 @@ pub struct QuicClientTransport {
     /// dropping it tears the connection down.
     _endpoint: quinn::Endpoint,
     connection: quinn::Connection,
+}
+
+/// Whether a QUIC error code is a TLS alert.
+///
+/// A crypto error carries the alert in its low byte (`0x100 | alert`).
+/// It means the peer ran the TLS handshake and it failed — the peer
+/// **answered**, and it refused our protocol.
+fn is_crypto_error_code(code: impl Into<u64>) -> bool {
+    (0x100..0x200).contains(&code.into())
+}
+
+/// Classify a failed QUIC handshake.
+///
+/// The question is not whether the peer answered at all, but whether
+/// it answered **our protocol**. A peer that refused our protocol is
+/// refused in turn: the WebSocket/TCP fallback is unencrypted, so
+/// falling back would hand the bearer token to a host that just
+/// proved it is not a tunnel gateway.
+///
+/// Everything else stays `Unreachable` — a wrong address, a blocked
+/// UDP path and a handshake that timed out are the documented reasons
+/// to fall back.
+fn classify_handshake_failure(e: quinn::ConnectionError) -> QuicConnectError {
+    match &e {
+        quinn::ConnectionError::VersionMismatch => {
+            QuicConnectError::Refused(format!("the gateway speaks another QUIC version: {e}"))
+        }
+        quinn::ConnectionError::ConnectionClosed(close)
+            if is_crypto_error_code(close.error_code) =>
+        {
+            QuicConnectError::Refused(format!(
+                "the gateway refused the QUIC handshake — it is not a tunnel gateway: {e}"
+            ))
+        }
+        quinn::ConnectionError::TransportError(t) if is_crypto_error_code(t.code) => {
+            QuicConnectError::Refused(format!(
+                "the gateway refused the QUIC handshake — it is not a tunnel gateway: {e}"
+            ))
+        }
+        _ => QuicConnectError::Unreachable(format!("quic handshake: {e}")),
+    }
 }
 
 impl QuicClientTransport {
@@ -433,9 +475,7 @@ impl QuicClientTransport {
                 if let Some(reason) = state.refusal() {
                     return Err(QuicConnectError::Untrusted(reason));
                 }
-                return Err(QuicConnectError::Unreachable(format!(
-                    "quic handshake: {e}"
-                )));
+                return Err(classify_handshake_failure(e));
             }
         };
 
@@ -719,5 +759,64 @@ mod tests {
         assert!(matches!(err, TunnelError::Untrusted(_)), "{err}");
         let err: TunnelError = QuicConnectError::Refused("bad token".into()).into();
         assert!(matches!(err, TunnelError::Refused(_)), "{err}");
+    }
+
+    /// A peer that closed the connection with a **crypto** error ran
+    /// the TLS handshake and refused our protocol. It answered, so it
+    /// must not be downgraded to the unencrypted transport.
+    #[test]
+    fn a_tls_alert_is_a_refusal() {
+        let close = quinn::ConnectionClose {
+            error_code: quinn::TransportErrorCode::crypto(120),
+            frame_type: None,
+            reason: Default::default(),
+        };
+        let error = classify_handshake_failure(quinn::ConnectionError::ConnectionClosed(close));
+        assert!(
+            matches!(error, QuicConnectError::Refused(_)),
+            "a TLS alert must be a refusal: {error}"
+        );
+    }
+
+    /// A peer that speaks another QUIC version answered as well — it
+    /// is not a tunnel gateway this tun can talk to.
+    #[test]
+    fn a_version_mismatch_is_a_refusal() {
+        let error = classify_handshake_failure(quinn::ConnectionError::VersionMismatch);
+        assert!(
+            matches!(error, QuicConnectError::Refused(_)),
+            "a version mismatch must be a refusal: {error}"
+        );
+    }
+
+    /// A failure that is not a crypto error leaves the gateway
+    /// unreachable: the address may be wrong and the UDP path may be
+    /// blocked, and the fallback is the way through.
+    #[test]
+    fn any_other_failure_leaves_the_gateway_unreachable() {
+        let close = quinn::ConnectionClose {
+            error_code: quinn::TransportErrorCode::NO_ERROR,
+            frame_type: None,
+            reason: Default::default(),
+        };
+        let error = classify_handshake_failure(quinn::ConnectionError::ConnectionClosed(close));
+        assert!(
+            matches!(error, QuicConnectError::Unreachable(_)),
+            "a plain close must leave the gateway unreachable: {error}"
+        );
+        let error = classify_handshake_failure(quinn::ConnectionError::TimedOut);
+        assert!(
+            matches!(error, QuicConnectError::Unreachable(_)),
+            "a timeout must leave the gateway unreachable: {error}"
+        );
+    }
+
+    /// A crypto error code is the TLS alert in the low byte.
+    #[test]
+    fn the_crypto_error_codes_are_recognised() {
+        assert!(is_crypto_error_code(quinn::TransportErrorCode::crypto(120)));
+        assert!(!is_crypto_error_code(quinn::TransportErrorCode::NO_ERROR));
+        assert!(!is_crypto_error_code(0x100u64 - 1));
+        assert!(!is_crypto_error_code(0x200u64));
     }
 }

@@ -6,12 +6,14 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::{
-    AuthReply, DEADLINE, Gateway, QuicMode, TOKEN, UpgradeReply, client, connect_to, echo_backend,
-    round_trip, unix_now,
+    AuthReply, DEADLINE, Gateway, QuicMode, TOKEN, UpgradeReply, client, client_at, connect_to,
+    echo_backend, round_trip, unix_now,
 };
 use pangolin_tun::client::QUIC_PROBE_SKIP_SECS;
-use pangolin_tun::{Error, SessionOutcome, TransportKind, TransportSelector};
+use pangolin_tun::{Error, SessionOutcome, TransportKind, TransportSelector, TunSettings};
 
 /// With both transports served, the session runs over QUIC.
 #[tokio::test]
@@ -61,11 +63,25 @@ async fn auto_falls_back_to_tcp_when_udp_does_not_answer() {
     let dir = tempfile::tempdir().unwrap();
     let client = client(dir.path(), &gateway, TransportSelector::Auto);
 
+    let started = Instant::now();
     let task = tokio::spawn(async move { client.connect_once().await });
     let session = tokio::time::timeout(DEADLINE, gateway.accept_tcp())
         .await
         .expect("the gateway must not hang")
         .into_session();
+
+    // The fallback waits the handshake timeout out: a client that
+    // gave up earlier would downgrade a network that only needed a
+    // moment.
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(4500),
+        "the fallback must not happen before the handshake timeout: {waited:?}"
+    );
+    assert!(
+        waited <= Duration::from_secs(20),
+        "the fallback must not take an age: {waited:?}"
+    );
 
     let mut stream = connect_to(&session, "127.0.0.1", backend_port).await;
     let echoed = round_trip(&mut stream, b"ping").await;
@@ -305,4 +321,128 @@ async fn a_refused_session_does_not_fall_back() {
         0,
         "the tun must not have opened a TCP connection"
     );
+}
+
+/// A host that is not a tunnel gateway never receives the bearer
+/// token.
+///
+/// The host answers QUIC but refuses our protocol: the fallback is
+/// unencrypted, and falling back would hand the bearer token to a
+/// host that just proved it is not the gateway.
+#[tokio::test]
+async fn a_host_that_is_not_a_tunnel_gateway_never_receives_the_token() {
+    let gateway = Gateway::bind(
+        QuicMode::Foreign,
+        AuthReply::Accept,
+        UpgradeReply::Refuse {
+            status: 404,
+            reason: "Not Found".into(),
+        },
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = client(dir.path(), &gateway, TransportSelector::Auto);
+
+    let outcome = tokio::time::timeout(DEADLINE, client.connect_once())
+        .await
+        .expect("the connect attempt must not hang");
+
+    match outcome {
+        SessionOutcome::NotConnected { transport, error } => {
+            assert_eq!(transport, Some(TransportKind::Quic));
+            let Error::Refused(message) = error else {
+                panic!("the host must have refused the protocol: {error}");
+            };
+            assert!(
+                message.contains("not a tunnel gateway"),
+                "the message must say what is wrong: {message}"
+            );
+        }
+        other => panic!("the session must not have been established: {other:?}"),
+    }
+    assert_eq!(
+        gateway.quic_connections(),
+        1,
+        "the tun must have reached the host over QUIC"
+    );
+    assert_eq!(
+        gateway.tcp_connections(),
+        0,
+        "the bearer token must not have travelled in cleartext"
+    );
+}
+
+/// A pin file that cannot be read stops the QUIC attempt — and the
+/// fallback does not happen either.
+#[tokio::test]
+async fn an_unreadable_pin_file_stops_the_quic_attempt() {
+    let gateway = Gateway::bind(QuicMode::Blackhole, AuthReply::Accept, UpgradeReply::Accept).await;
+    let dir = tempfile::tempdir().unwrap();
+    // The pin file's path points at a directory: it cannot be read.
+    let client = pangolin_tun::TunnelClient::new(TunSettings {
+        server: gateway.addr.clone(),
+        token: TOKEN.to_string(),
+        name: common::NAME.to_string(),
+        transport: TransportSelector::Auto,
+        pin_path: dir.path().to_path_buf(),
+        quic_failure_path: dir.path().join("tun.quic-fail"),
+    });
+
+    let outcome = tokio::time::timeout(DEADLINE, client.connect_once())
+        .await
+        .expect("the connect attempt must not hang");
+
+    match outcome {
+        SessionOutcome::NotConnected { transport, error } => {
+            assert_eq!(transport, Some(TransportKind::Quic));
+            assert!(
+                matches!(error, Error::Io(_)),
+                "an unreadable pin file is an I/O failure: {error}"
+            );
+        }
+        other => panic!("the session must not have been established: {other:?}"),
+    }
+    assert_eq!(
+        gateway.tcp_connections(),
+        0,
+        "the tun must not have opened a TCP connection"
+    );
+    assert_eq!(
+        gateway.udp_datagrams(),
+        0,
+        "the tun must not have sent a datagram"
+    );
+}
+
+/// A gateway that is not there at all is unreachable on both
+/// transports.
+#[tokio::test]
+async fn a_gateway_that_is_not_there_is_unreachable_on_both_transports() {
+    // Bind and drop a listener, so the port is almost certainly free.
+    let port = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = client_at(
+        dir.path(),
+        &format!("127.0.0.1:{port}"),
+        TransportSelector::Auto,
+    );
+
+    let outcome = tokio::time::timeout(DEADLINE, client.connect_once())
+        .await
+        .expect("the connect attempt must not hang");
+
+    match outcome {
+        SessionOutcome::NotConnected { transport, error } => {
+            assert_eq!(transport, Some(TransportKind::Tcp));
+            assert!(
+                matches!(error, Error::Unreachable(_)),
+                "a gateway that is not there is unreachable: {error}"
+            );
+        }
+        other => panic!("the session must not have been established: {other:?}"),
+    }
 }
