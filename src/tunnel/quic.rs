@@ -383,8 +383,8 @@ pub struct QuicClientTransport {
 /// Whether a QUIC error code is a TLS alert.
 ///
 /// A crypto error carries the alert in its low byte (`0x100 | alert`).
-/// It means the peer ran the TLS handshake and it failed — the peer
-/// **answered**, and it refused our protocol.
+/// It means the TLS handshake ran and failed: the peer **answered**,
+/// and the two ends could not agree on our protocol.
 fn is_crypto_error_code(code: impl Into<u64>) -> bool {
     (0x100..0x200).contains(&code.into())
 }
@@ -409,12 +409,12 @@ fn classify_handshake_failure(e: quinn::ConnectionError) -> QuicConnectError {
             if is_crypto_error_code(close.error_code) =>
         {
             QuicConnectError::Refused(format!(
-                "the gateway refused the QUIC handshake — it is not a tunnel gateway: {e}"
+                "the QUIC handshake failed — the peer is not a tunnel gateway: {e}"
             ))
         }
         quinn::ConnectionError::TransportError(t) if is_crypto_error_code(t.code) => {
             QuicConnectError::Refused(format!(
-                "the gateway refused the QUIC handshake — it is not a tunnel gateway: {e}"
+                "the QUIC handshake failed — the peer is not a tunnel gateway: {e}"
             ))
         }
         _ => QuicConnectError::Unreachable(format!("quic handshake: {e}")),
