@@ -93,6 +93,33 @@ async fn a_connect_instruction_with_a_line_break_in_the_host_is_refused() {
     .await;
 }
 
+/// A malformed instruction that fills the line bound is still
+/// answered with a reply the gateway can read.
+///
+/// The reason quotes the instruction it is about, so it can be as
+/// long as the instruction — and the reply is a protocol line too.
+#[tokio::test]
+async fn a_malformed_instruction_at_the_line_bound_is_answered_with_a_readable_reply() {
+    each_transport(|wired| async move {
+        // An instruction that fills the line bound and cannot be
+        // decoded: it carries no port.
+        let mut bytes = b"CONNECT ".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 4096 - b"CONNECT ".len() - 3));
+        bytes.extend_from_slice(b"\r\n");
+        let mut stream = open_raw_stream(&wired.session, &bytes).await;
+
+        let reply = read_crlf_line(&mut stream).await.unwrap();
+        assert!(
+            reply.starts_with("ERR "),
+            "the tun must refuse the instruction over {}: {reply:?}",
+            wired.kind
+        );
+
+        wired.outcome().await;
+    })
+    .await;
+}
+
 /// A target whose name does not resolve is answered with `ERR`.
 #[tokio::test]
 async fn a_target_that_does_not_resolve_is_answered_with_err() {
@@ -104,10 +131,12 @@ async fn a_target_that_does_not_resolve_is_answered_with_err() {
             "the tun must answer ERR over {}, got {reply:?}",
             wired.kind
         );
-        let reason = reply.trim_start_matches("ERR ");
+        // The reply is the last thing on the stream: the reason
+        // cannot have smuggled a second line behind it.
+        let rest = drain(&mut stream).await;
         assert!(
-            !reason.contains('\r') && !reason.contains('\n'),
-            "the reason must be one line over {}: {reason:?}",
+            rest.is_empty(),
+            "nothing may follow the reply over {}: {rest:?}",
             wired.kind
         );
 
