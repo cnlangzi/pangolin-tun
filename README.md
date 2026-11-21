@@ -72,17 +72,23 @@ already configured and bound, and the endpoint serves the connections that
 arrive on it. The socket options have to be set **before** the bind, and the
 crate cannot set them itself — it binds the socket internally.
 
-That is what a handover needs. `SO_REUSEPORT` lets the incoming generation
-bind the address the outgoing generation still holds: the port is never
-unheld, and the kernel spreads the connections over the two sockets by the
-hash of each connection's 4-tuple. The group re-spreads the connections that
-were already up when it grew — a connection whose hash lands on the socket
-that joined is delivered to an endpoint that does not know it.
-
-The socket has to be bound, and bound to the address the caller passes in —
-an unbound socket, or one bound to another address, is refused with
+The socket is where the endpoint listens. `addr` is a cross-check on it and
+not the address the endpoint is bound to, so it has to be the socket's own
+address: an unbound socket, or one bound to another address, is refused with
 `Error::Invalid` instead of yielding an endpoint that listens somewhere else.
 The call needs a tokio runtime.
+
+`SO_REUSEPORT` lets the incoming generation bind the address the outgoing
+generation still holds: the port is never unheld, and the kernel spreads the
+connections over the two sockets by the hash of each connection's 4-tuple.
+
+The group re-spreads the connections that were already up when it grew. A
+connection whose hash lands on the socket that joined is delivered to an
+endpoint that does not know it: the session is torn down, the tun reconnects
+(the client is back in about a second), and the gateway's requests on that
+session fail. Measured on Linux, **about half of the sessions that were up
+lose their packets to the socket that joined** — a handover is not seamless
+for the sessions that are already running.
 
 ## Using the client
 
