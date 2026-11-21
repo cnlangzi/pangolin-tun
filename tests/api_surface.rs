@@ -44,6 +44,7 @@ use pangolin_tun::{
     bearer_token,
     // The QUIC transports.
     bind_endpoint,
+    bind_endpoint_with_socket,
     // The WebSocket handshake helpers.
     build_ws_upgrade_request,
     // The QUIC transport's constants and helpers.

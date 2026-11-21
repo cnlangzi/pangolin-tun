@@ -57,6 +57,33 @@ the fallback is unencrypted, so it would hand the bearer token to whoever is
 presenting the wrong certificate, or carry a token the gateway already
 refused.
 
+## The gateway's QUIC endpoint
+
+The gateway serves QUIC on one UDP port. There are two ways to bind that
+endpoint, and they differ in who owns the socket:
+
+| Function | The socket | Use it when |
+| --- | --- | --- |
+| `bind_endpoint(addr, cert)` | the crate binds it | the gateway starts and stays up |
+| `bind_endpoint_with_socket(addr, socket, cert)` | the caller binds it | the gateway hands over to another process |
+
+`bind_endpoint_with_socket` takes a `std::net::UdpSocket` the caller has
+already configured and bound, and the endpoint serves the connections that
+arrive on it. The socket options have to be set **before** the bind, and the
+crate cannot set them itself — it binds the socket internally.
+
+That is what a handover needs. `SO_REUSEPORT` lets the incoming generation
+bind the address the outgoing generation still holds: the port is never
+unheld, and the kernel spreads the connections over the two sockets by the
+hash of each connection's 4-tuple. The group re-spreads the connections that
+were already up when it grew — a connection whose hash lands on the socket
+that joined is delivered to an endpoint that does not know it.
+
+The socket has to be bound, and bound to the address the caller passes in —
+an unbound socket, or one bound to another address, is refused with
+`Error::Invalid` instead of yielding an endpoint that listens somewhere else.
+The call needs a tokio runtime.
+
 ## Using the client
 
 The client takes its settings from the caller — it reads no configuration file

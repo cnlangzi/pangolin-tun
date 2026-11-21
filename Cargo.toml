@@ -1,6 +1,6 @@
 [package]
 name = "pangolin-tun"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -47,6 +47,11 @@ tokio = { version = "1", default-features = false, features = [
 tokio-yamux = { version = "0.3.20", default-features = false, features = ["tokio-timer"] }
 
 [dev-dependencies]
+# The tests set `SO_REUSEPORT` on a socket the caller binds and hands
+# over. The option is unix-only, and `socket2` 0.6 is already in the
+# tree through tokio's `net` feature — with the same `all` feature —
+# so the crate's dependency graph for its consumers does not change.
+socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
