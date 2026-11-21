@@ -453,6 +453,12 @@ where
 /// A plain "copy until both sides are done" would tear the whole
 /// connection down as soon as one side finished — killing a response
 /// whose request side had already ended.
+///
+/// The first error either side reports ends the relay: both
+/// directions are torn down and the error is returned. An error is
+/// not an end-of-file — it says that the bytes that were still to
+/// come will never come, and a caller that cannot tell the two apart
+/// reads a failed tunnel as a finished one.
 pub async fn relay_bidirectional<A, B>(a: &mut A, b: &mut B) -> Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -477,19 +483,22 @@ where
                         a_done = true;
                     }
                     Ok(n) => {
-                        if b_write.write_all(&buf_ab[..n]).await.is_err() {
+                        if let Err(e) = b_write.write_all(&buf_ab[..n]).await {
                             // The other side is gone — tear both
                             // directions down, or the loop would
                             // spin on a failing write.
                             let _ = a_write.shutdown().await;
                             let _ = b_write.shutdown().await;
-                            a_done = true;
-                            b_done = true;
+                            return Err(TunnelError::Io(e));
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        // The read failed: the bytes that were still to
+                        // come will never come, so both directions go
+                        // down and the failure is reported.
+                        let _ = a_write.shutdown().await;
                         let _ = b_write.shutdown().await;
-                        a_done = true;
+                        return Err(TunnelError::Io(e));
                     }
                 }
             }
@@ -500,16 +509,19 @@ where
                         b_done = true;
                     }
                     Ok(n) => {
-                        if a_write.write_all(&buf_ba[..n]).await.is_err() {
+                        if let Err(e) = a_write.write_all(&buf_ba[..n]).await {
                             let _ = b_write.shutdown().await;
                             let _ = a_write.shutdown().await;
-                            a_done = true;
-                            b_done = true;
+                            return Err(TunnelError::Io(e));
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        // The read failed: the bytes that were still to
+                        // come will never come, so both directions go
+                        // down and the failure is reported.
+                        let _ = b_write.shutdown().await;
                         let _ = a_write.shutdown().await;
-                        b_done = true;
+                        return Err(TunnelError::Io(e));
                     }
                 }
             }
@@ -904,5 +916,120 @@ mod tests {
         let mut seen = Vec::new();
         a_peer.read_to_end(&mut seen).await.unwrap();
         assert_eq!(seen, b"hello");
+    }
+
+    /// A side that fails ends the relay, and the error reaches the
+    /// caller. A relay that swallows it reads a dead tunnel as a
+    /// finished one — and the truncated response it relays looks like
+    /// a whole one.
+    #[tokio::test]
+    async fn the_relay_reports_a_failing_side() {
+        let (mut other, _other_peer) = tokio::io::duplex(64);
+        let mut failing = FailingStream;
+        let err = relay_bidirectional(&mut failing, &mut other)
+            .await
+            .expect_err("a failing side must not be swallowed");
+        match err {
+            TunnelError::Io(e) => assert_eq!(e.kind(), ErrorKind::NotConnected, "{e}"),
+            other => panic!("the relay must report the I/O failure: {other:?}"),
+        }
+    }
+
+    /// A write that fails ends the relay too: the bytes the other side
+    /// sent cannot be handed over, and the failure is reported.
+    #[tokio::test]
+    async fn the_relay_reports_a_failing_write() {
+        let (mut other, mut other_peer) = tokio::io::duplex(64);
+        other_peer.write_all(b"hello").await.unwrap();
+        let mut failing = FailingWriteStream;
+        let err = relay_bidirectional(&mut other, &mut failing)
+            .await
+            .expect_err("a failing write must not be swallowed");
+        match err {
+            TunnelError::Io(e) => assert_eq!(e.kind(), ErrorKind::BrokenPipe, "{e}"),
+            other => panic!("the relay must report the I/O failure: {other:?}"),
+        }
+    }
+
+    /// A stream whose read always fails — the tunnel's session died
+    /// under it.
+    struct FailingStream;
+
+    impl AsyncRead for FailingStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(Error::new(
+                ErrorKind::NotConnected,
+                "the tunnel session ended",
+            )))
+        }
+    }
+
+    impl AsyncWrite for FailingStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A stream that takes every byte and hands none of them on: the
+    /// other side is gone.
+    struct FailingWriteStream;
+
+    impl AsyncRead for FailingWriteStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for FailingWriteStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(Error::new(
+                ErrorKind::BrokenPipe,
+                "the other side is gone",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
     }
 }

@@ -10,11 +10,14 @@
 //! when it failed because the gateway was *untrusted* or *refused*.
 
 use std::io::{Error, ErrorKind};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 
 use fastwebsockets::{Frame, OpCode, Payload, WebSocket};
 use log::debug;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
 use tokio_yamux as yamux;
@@ -27,8 +30,117 @@ use crate::tunnel::{TunnelRole, TunnelStream, TunnelTransport};
 /// WebSocket objects manually.
 pub use fastwebsockets::Role as WsRole;
 
-/// A yamux stream handle, re-exported for callers that name the type.
-pub use yamux::StreamHandle as YamuxStream;
+/// A stream of the WebSocket transport.
+///
+/// It wraps the upstream handle and the tunnel's liveness flag, so
+/// that the end of the tunnel's **session** is reported as an error
+/// instead of as a clean end-of-file.
+///
+/// The wrapper dereferences to the upstream handle, so `id()`,
+/// `state()`, `recv_window()`, `send_window()` and `peek()` keep
+/// working for a caller that holds the concrete type. `peek()` is the
+/// upstream method, though: it reports the end of the byte stream the
+/// way it always did, and only a read reports the session's death.
+///
+/// Once the session is dead, every read reports it — including a read
+/// on a stream whose peer had already closed it cleanly. The upstream
+/// handle cannot tell the two apart: a peer's FIN and a dropped
+/// session end the stream the same way.
+#[derive(Debug)]
+pub struct YamuxStream {
+    handle: StreamHandle,
+    session_ended: Arc<AtomicBool>,
+}
+
+impl YamuxStream {
+    /// Wrap a handle of a session and the flag that marks the
+    /// session's end.
+    fn new(handle: StreamHandle, session_ended: Arc<AtomicBool>) -> Self {
+        Self {
+            handle,
+            session_ended,
+        }
+    }
+}
+
+impl std::ops::Deref for YamuxStream {
+    type Target = StreamHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
+impl std::ops::DerefMut for YamuxStream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle
+    }
+}
+
+impl AsyncRead for YamuxStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        // A read into a buffer with no room fills nothing by itself:
+        // it says nothing about the end of the byte stream.
+        let had_room = buf.remaining() > 0;
+        match Pin::new(&mut this.handle).poll_read(cx, buf) {
+            // A read that filled no bytes is the end of the byte
+            // stream. On a dead session it is the session's death and
+            // not the peer's goodbye.
+            Poll::Ready(Ok(())) if had_room && buf.filled().len() == before => {
+                if this.session_ended.load(Ordering::Acquire) {
+                    Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "the tunnel session ended",
+                    )))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+impl AsyncWrite for YamuxStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().handle).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().handle).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().handle).poll_shutdown(cx)
+    }
+}
+
+/// Owns the yamux session and marks the tunnel dead when it goes.
+///
+/// The `Drop` body runs before the fields are dropped, so the flag is
+/// set before the session's per-stream frame senders are dropped — and
+/// therefore before any stream can read the end-of-file that the dead
+/// session causes.
+struct SessionGuard<T> {
+    session: Session<T>,
+    session_ended: Arc<AtomicBool>,
+}
+
+impl<T> Drop for SessionGuard<T> {
+    fn drop(&mut self) {
+        self.session_ended.store(true, Ordering::Release);
+    }
+}
 
 // Re-exports for the manual WS handshake helpers below.
 use base64::Engine;
@@ -65,13 +177,13 @@ pub struct YamuxTunnel {
     /// Channel for sending `open_stream` requests to the
     /// driver task. Each request is a oneshot that the
     /// driver replies to with the resulting
-    /// `Result<StreamHandle, Error>`.
+    /// `Result<YamuxStream, Error>`.
     open_tx: mpsc::UnboundedSender<OpenRequest>,
     /// Channel for sending `accept_stream` requests. The
     /// driver task maintains a queue of pending accepts
     /// and routes incoming stream-open events to the
     /// next waiting caller.
-    accept_tx: mpsc::UnboundedSender<oneshot::Sender<Result<StreamHandle>>>,
+    accept_tx: mpsc::UnboundedSender<oneshot::Sender<Result<YamuxStream>>>,
     /// Which role this endpoint plays.
     pub role: TunnelRole,
     /// Abort handle for the bridge/driver task. Held for
@@ -86,7 +198,7 @@ pub struct YamuxTunnel {
 }
 
 struct OpenRequest {
-    reply: oneshot::Sender<std::result::Result<StreamHandle, yamux::Error>>,
+    reply: oneshot::Sender<std::result::Result<YamuxStream, yamux::Error>>,
 }
 
 impl std::fmt::Debug for YamuxTunnel {
@@ -112,7 +224,7 @@ impl Clone for YamuxTunnel {
 impl YamuxTunnel {
     /// Open a new outbound yamux stream. Each HTTP request or
     /// WS connection gets its own stream.
-    pub async fn open_stream(&self) -> Result<StreamHandle> {
+    pub async fn open_stream(&self) -> Result<YamuxStream> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.open_tx
             .send(OpenRequest { reply: reply_tx })
@@ -129,7 +241,7 @@ impl YamuxTunnel {
 
     /// Accept the next inbound yamux stream. Returns
     /// `None` when the session has ended.
-    pub async fn accept_stream(&self) -> Option<Result<StreamHandle>> {
+    pub async fn accept_stream(&self) -> Option<Result<YamuxStream>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.accept_tx.send(reply_tx).is_err() {
             return None;
@@ -183,8 +295,15 @@ where
         TunnelRole::Server => Session::new_server(yamux_side, yamux_config()),
         TunnelRole::Client => Session::new_client(yamux_side, yamux_config()),
     };
+    // The flag marks the session's end. The guard sets it when the
+    // session goes, and every stream the tunnel hands out carries it.
+    let session_ended = Arc::new(AtomicBool::new(false));
+    let guard = SessionGuard {
+        session,
+        session_ended,
+    };
     let (open_tx, open_rx) = mpsc::unbounded_channel::<OpenRequest>();
-    let (accept_tx, accept_rx) = mpsc::unbounded_channel::<oneshot::Sender<Result<StreamHandle>>>();
+    let (accept_tx, accept_rx) = mpsc::unbounded_channel::<oneshot::Sender<Result<YamuxStream>>>();
     let session_end = Arc::new(tokio::sync::Notify::new());
     let session_end_for_task = session_end.clone();
 
@@ -200,7 +319,7 @@ where
         // Bridge the WS and the duplex.
         let bridge_fut = ws_bridge(ws, ws_side);
         // Drive the session.
-        let driver_fut = session_driver(session, open_rx, accept_rx);
+        let driver_fut = session_driver(guard, open_rx, accept_rx);
         // Whichever finishes first cancels the other.
         tokio::select! {
             _ = bridge_fut => {}
@@ -224,12 +343,13 @@ where
 /// callers waiting on `accept_stream`; processes
 /// `open_stream` requests received on `open_rx`.
 async fn session_driver(
-    mut session: Session<tokio::io::DuplexStream>,
+    mut guard: SessionGuard<tokio::io::DuplexStream>,
     mut open_rx: mpsc::UnboundedReceiver<OpenRequest>,
-    mut accept_rx: mpsc::UnboundedReceiver<oneshot::Sender<Result<StreamHandle>>>,
+    mut accept_rx: mpsc::UnboundedReceiver<oneshot::Sender<Result<YamuxStream>>>,
 ) {
     use futures_util::StreamExt;
-    let mut pending_accepts: std::collections::VecDeque<oneshot::Sender<Result<StreamHandle>>> =
+    let session_ended = guard.session_ended.clone();
+    let mut pending_accepts: std::collections::VecDeque<oneshot::Sender<Result<YamuxStream>>> =
         std::collections::VecDeque::new();
     loop {
         tokio::select! {
@@ -237,7 +357,8 @@ async fn session_driver(
             // Open-stream requests from callers.
             req = open_rx.recv() => {
                 let Some(req) = req else { break; };
-                let result = session.open_stream();
+                let result = guard.session.open_stream()
+                    .map(|handle| YamuxStream::new(handle, session_ended.clone()));
                 let _ = req.reply.send(result);
             }
             // Accept-stream requests from callers.
@@ -248,11 +369,11 @@ async fn session_driver(
             // Incoming yamux events: an opened stream
             // (server side) is dispatched to the next
             // pending accept.
-            ev = session.next() => {
+            ev = guard.session.next() => {
                 match ev {
                     Some(Ok(stream)) => {
                         if let Some(reply) = pending_accepts.pop_front() {
-                            let _ = reply.send(Ok(stream));
+                            let _ = reply.send(Ok(YamuxStream::new(stream, session_ended.clone())));
                         }
                         // If nobody is waiting, drop the
                         // stream — the remote opener will
@@ -723,7 +844,45 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::poll_fn;
+    use std::time::Duration;
+
     use super::*;
+
+    /// Two tunnels connected to each other over a WebSocket.
+    fn tunnel_pair() -> (YamuxTunnel, YamuxTunnel) {
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        (
+            tunnel_over_websocket(
+                wrap_websocket(client_side, WsRole::Client),
+                TunnelRole::Client,
+            ),
+            tunnel_over_websocket(
+                wrap_websocket(server_side, WsRole::Server),
+                TunnelRole::Server,
+            ),
+        )
+    }
+
+    /// Open a stream on the client and accept it on the server.
+    ///
+    /// The tunnel's driver drops a stream that arrives while nobody
+    /// waits for it, so the accept request has to be on its way
+    /// before the client opens the stream.
+    async fn open_and_accept(
+        client: &YamuxTunnel,
+        server: &YamuxTunnel,
+    ) -> (YamuxStream, YamuxStream) {
+        let mut accept = Box::pin(server.accept_stream());
+        // Poll the acceptor once: the request is sent, and no stream
+        // can have arrived yet.
+        let pending = poll_fn(|cx| Poll::Ready(accept.as_mut().poll(cx))).await;
+        assert!(pending.is_pending(), "no stream has been opened yet");
+
+        let client_stream = client.open_stream().await.unwrap();
+        let server_stream = accept.await.unwrap().unwrap();
+        (client_stream, server_stream)
+    }
 
     /// The `Sec-WebSocket-Accept` value is the RFC 6455 §1.3
     /// derivation — a gateway and a tun that compute it differently
@@ -879,5 +1038,101 @@ mod tests {
             !text.lines().any(|line| line.starts_with("X-Injected")),
             "the value must not become a header of its own: {text}"
         );
+    }
+
+    /// A session that dies while a stream is open reports its death on
+    /// that stream: the read is an error, not a clean end-of-file.
+    ///
+    /// A clean end-of-file says "the peer finished sending"; a dead
+    /// session says "the bytes that were still to come will never
+    /// come". A consumer that cannot tell the two apart relays a
+    /// truncated response as if it were a whole one.
+    #[tokio::test]
+    async fn a_dead_session_reports_its_death_on_the_open_stream() {
+        let (client, server) = tunnel_pair();
+        let (_client_stream, mut server_stream) = open_and_accept(&client, &server).await;
+
+        // The session dies: the bridge task is dropped, and with it
+        // the yamux session.
+        server.bridge_abort.abort();
+
+        let mut buf = [0u8; 16];
+        let err = tokio::time::timeout(Duration::from_secs(5), server_stream.read(&mut buf))
+            .await
+            .expect("the read must not hang")
+            .expect_err("a dead session must not read as an end-of-file");
+        assert_eq!(err.kind(), ErrorKind::NotConnected);
+        assert_eq!(err.to_string(), "the tunnel session ended");
+    }
+
+    /// A read into a buffer with no room fills nothing by itself: it
+    /// says nothing about the end of the byte stream, and it must not
+    /// report the session's death either.
+    #[tokio::test]
+    async fn an_empty_read_is_not_the_death() {
+        let (client, server) = tunnel_pair();
+        let (_client_stream, mut server_stream) = open_and_accept(&client, &server).await;
+        server.bridge_abort.abort();
+        let mut empty: [u8; 0] = [];
+        let n = tokio::time::timeout(Duration::from_secs(5), server_stream.read(&mut empty))
+            .await
+            .expect("the read must not hang")
+            .expect("an empty read must not be the death");
+        assert_eq!(n, 0);
+    }
+
+    /// A peer that closes its half of the stream sends a FIN: the read
+    /// is still a clean end-of-file, and the new check does not fire.
+    #[tokio::test]
+    async fn a_cleanly_closed_stream_still_reads_an_end_of_file() {
+        let (client, server) = tunnel_pair();
+        let (mut client_stream, mut server_stream) = open_and_accept(&client, &server).await;
+
+        // The gateway closes its half of the stream.
+        server_stream.shutdown().await.unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), client_stream.read(&mut buf))
+            .await
+            .expect("the read must not hang")
+            .expect("a clean close must not be an error");
+        assert_eq!(n, 0, "the peer that finished sending reads as zero bytes");
+    }
+
+    /// Data that arrived before the session died is delivered first;
+    /// the read after it reports the death.
+    #[tokio::test]
+    async fn the_data_that_arrived_before_the_death_is_delivered_first() {
+        let (client, server) = tunnel_pair();
+        let (mut client_stream, mut server_stream) = open_and_accept(&client, &server).await;
+
+        client_stream.write_all(b"hello").await.unwrap();
+        client_stream.flush().await.unwrap();
+
+        // Wait until the bytes are in the stream's buffer, so the
+        // death cannot overtake them.
+        let mut peeked = [0u8; 5];
+        let buffered =
+            tokio::time::timeout(Duration::from_secs(5), server_stream.peek(&mut peeked))
+                .await
+                .expect("the data must arrive")
+                .expect("the peek must not fail");
+        assert_eq!(buffered, 5);
+
+        server.bridge_abort.abort();
+
+        let mut buf = [0u8; 5];
+        let n = tokio::time::timeout(Duration::from_secs(5), server_stream.read(&mut buf))
+            .await
+            .expect("the read must not hang")
+            .expect("the data must be delivered");
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"hello");
+
+        let err = tokio::time::timeout(Duration::from_secs(5), server_stream.read(&mut buf))
+            .await
+            .expect("the read must not hang")
+            .expect_err("the dead session must not read as an end-of-file");
+        assert_eq!(err.kind(), ErrorKind::NotConnected);
     }
 }

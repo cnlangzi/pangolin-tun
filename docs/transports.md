@@ -72,6 +72,28 @@ The WebSocket carries a **yamux** session: the client runs the yamux client,
 the gateway runs the yamux server. The gateway opens a yamux stream per
 request; the client accepts them.
 
+## The streams of a session
+
+A session carries one stream per request, and every stream of a session ends
+the way the session ends. A consumer that copies between a tunnel stream and
+a socket has to tell three endings apart:
+
+| The stream ended because | The read returns |
+| --- | --- |
+| the session died — the transport gave up, the peer went away, or the session saw a go-away | an error of the kind `NotConnected` |
+| the peer reset the stream | an error of the kind `ConnectionReset` |
+| the peer finished its half of the stream | `Ok(0)` — a clean end-of-file |
+
+The two transports report the same kinds for the same events, so a consumer
+needs no per-transport branch.
+
+A clean end-of-file is the peer's goodbye: the bytes that arrived are whole,
+and no more are coming. The end of the **session** is a failure: the bytes
+that were still to come will never come. A consumer that reads it as an
+end-of-file hands a truncated request to its backend and relays a truncated
+response to its client — and neither the client nor the tunnel learns that
+anything went wrong.
+
 ## The fallback policy
 
 The transport is chosen **once per session**.
