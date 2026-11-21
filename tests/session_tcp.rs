@@ -8,6 +8,7 @@ use common::{
     echo_backend, round_trip,
 };
 use pangolin_tun::{Error, SessionOutcome, TransportKind, TransportSelector};
+use tokio::io::AsyncReadExt;
 
 /// The client's session relays the gateway's bytes to the backend and
 /// the backend's bytes back.
@@ -36,6 +37,52 @@ async fn a_session_over_the_websocket_transport_relays_the_bytes() {
 
     match outcome {
         SessionOutcome::Ended { transport } => assert_eq!(transport, TransportKind::Tcp),
+        other => panic!("the session must have ended over the TCP transport: {other:?}"),
+    }
+}
+
+/// A gateway whose session dies while a stream is open reports the
+/// death on that stream: the read is an error, not a clean
+/// end-of-file.
+///
+/// A clean end-of-file says "the peer finished sending"; a dead
+/// session says "the bytes that were still to come will never come".
+/// A gateway that cannot tell the two apart relays a truncated
+/// response as if it were a whole one.
+#[tokio::test]
+async fn a_dead_session_reports_the_death_on_the_open_stream() {
+    let gateway = Gateway::bind(QuicMode::Serve, AuthReply::Accept, UpgradeReply::Accept).await;
+    let (backend_port, _backend) = echo_backend().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = client(dir.path(), &gateway, TransportSelector::Tcp);
+
+    let task = tokio::spawn(async move { client.connect_once().await });
+    let session = tokio::time::timeout(DEADLINE, gateway.accept_tcp())
+        .await
+        .expect("the gateway must not hang")
+        .into_session();
+
+    let mut stream = connect_to(&session, "127.0.0.1", backend_port).await;
+
+    // The gateway's session dies while the stream is open.
+    session.close();
+
+    let mut buf = [0u8; 16];
+    let err = tokio::time::timeout(DEADLINE, stream.read(&mut buf))
+        .await
+        .expect("the read must not hang")
+        .expect_err("a dead session must not read as an end-of-file");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+    assert_eq!(err.to_string(), "the tunnel session ended");
+
+    let outcome = tokio::time::timeout(DEADLINE, task)
+        .await
+        .expect("the session must not hang")
+        .expect("the client must not panic");
+    match outcome {
+        SessionOutcome::Ended { transport } | SessionOutcome::Errored { transport, .. } => {
+            assert_eq!(transport, TransportKind::Tcp)
+        }
         other => panic!("the session must have ended over the TCP transport: {other:?}"),
     }
 }
