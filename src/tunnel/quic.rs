@@ -599,31 +599,115 @@ impl TunnelTransport for QuicServerTransport {
 // The gateway's endpoint
 // ---------------------------------------------------------------------------
 
-/// Bind the gateway's QUIC endpoint on `addr`.
+/// The gateway's QUIC server configuration.
 ///
-/// The endpoint speaks the tunnel's ALPN only, so it cannot be
-/// confused with another QUIC service on the same port.
-pub fn bind_endpoint(addr: SocketAddr, cert: &QuicCert) -> Result<quinn::Endpoint> {
-    crate::install_crypto_provider();
+/// Both ways of binding the endpoint build it here, so a caller that
+/// hands the crate its own socket gets an endpoint that behaves like
+/// the one the crate binds itself.
+fn server_config(cert: &QuicCert) -> Result<quinn::ServerConfig> {
     let cert_der = rustls::pki_types::CertificateDer::from(cert.cert_der.clone());
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
         rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_der.clone()),
     );
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| TunnelError::Invalid(format!("tls protocol versions: {e}")))?
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
         .map_err(|e| TunnelError::Invalid(format!("the tunnel certificate is not usable: {e}")))?;
-    server_config.alpn_protocols = vec![TUNNEL_ALPN.to_vec()];
-    let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
+    tls.alpn_protocols = vec![TUNNEL_ALPN.to_vec()];
+    let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|e| TunnelError::Invalid(format!("quic server config: {e}")))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
     // The tunnel session is long-lived: the idle timeout is paired
     // with a keep-alive so a quiet connection stays open.
     config.transport_config(Arc::new(transport_config()));
+    Ok(config)
+}
+
+/// Bind the gateway's QUIC endpoint on `addr`.
+///
+/// The endpoint speaks the tunnel's ALPN only, so it cannot be
+/// confused with another QUIC service on the same port.
+///
+/// The call needs a tokio runtime; without one it fails with
+/// [`crate::Error::Io`] — the error it has always returned, which
+/// [`bind_endpoint_with_socket`] deliberately does not share.
+pub fn bind_endpoint(addr: SocketAddr, cert: &QuicCert) -> Result<quinn::Endpoint> {
+    crate::install_crypto_provider();
+    let config = server_config(cert)?;
     quinn::Endpoint::server(config, addr).map_err(|e| {
+        TunnelError::Io(std::io::Error::other(format!(
+            "bind the quic endpoint: {e}"
+        )))
+    })
+}
+
+/// Bind the gateway's QUIC endpoint on a socket the caller owns.
+///
+/// The caller binds the socket itself and hands it over unchanged, so
+/// it can set the socket options the crate knows nothing about —
+/// `SO_REUSEPORT` above all, which has to be set **before** the
+/// bind. The socket is where the endpoint listens; `addr` is a
+/// cross-check on it and not the address the endpoint is bound to, so
+/// it has to be the socket's own address.
+///
+/// The socket has to be **bound**, and bound to `addr`: an unbound
+/// socket would yield an endpoint that is alive but never receives a
+/// datagram, and a socket bound to another address would put the
+/// endpoint somewhere the caller does not expect — the failure that
+/// silently degrades the tunnel to its WebSocket/TCP fallback.
+///
+/// The call needs a tokio runtime; without one it is refused with
+/// [`crate::Error::Invalid`] rather than panicking. [`bind_endpoint`]
+/// reports the same fault as [`crate::Error::Io`]: it keeps the error
+/// it has always returned, so a caller that upgrades sees no change.
+///
+/// # A handover costs the sessions that were up
+///
+/// A gateway that hands over between two generations binds the same
+/// address twice: the outgoing generation still holds the port while
+/// the incoming one takes its place. The kernel spreads the
+/// connections over the two sockets by the hash of each connection's
+/// 4-tuple — and it re-spreads the connections that were already up
+/// when the group grew. Measured on Linux, **about half of the
+/// sessions that were up lose their packets to the socket that
+/// joined**: they are torn down, the tun reconnects (the crate's own
+/// client is back in about a second), and the gateway's requests on
+/// those sessions fail.
+pub fn bind_endpoint_with_socket(
+    addr: SocketAddr,
+    socket: std::net::UdpSocket,
+    cert: &QuicCert,
+) -> Result<quinn::Endpoint> {
+    crate::install_crypto_provider();
+    let local = socket
+        .local_addr()
+        .map_err(|e| TunnelError::Invalid(format!("the quic socket is not bound: {e}")))?;
+    if local.port() == 0 {
+        return Err(TunnelError::Invalid(
+            "the quic socket is not bound: it has no local port".into(),
+        ));
+    }
+    if local != addr {
+        return Err(TunnelError::Invalid(format!(
+            "the quic socket is bound to {local}, not to {addr}; pass the socket's own address"
+        )));
+    }
+    let Some(runtime) = quinn::default_runtime() else {
+        return Err(TunnelError::Invalid(
+            "the quic endpoint needs a tokio runtime".into(),
+        ));
+    };
+    let config = server_config(cert)?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(config),
+        socket,
+        runtime,
+    )
+    .map_err(|e| {
         TunnelError::Io(std::io::Error::other(format!(
             "bind the quic endpoint: {e}"
         )))

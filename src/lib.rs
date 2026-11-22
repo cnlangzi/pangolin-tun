@@ -94,8 +94,8 @@ pub use settings::{TransportSelector, TunSettings};
 pub use tunnel::pin::{PinState, PinStore, PinVerdict, PinningVerifier};
 pub use tunnel::quic::{
     QUIC_CERT_FILE, QUIC_KEY_FILE, QuicBiStream, QuicCert, QuicClientTransport, QuicConnectError,
-    QuicHandshake, QuicServerTransport, TUNNEL_ALPN, bind_endpoint, certificate_dir, fingerprint,
-    transport_config,
+    QuicHandshake, QuicServerTransport, TUNNEL_ALPN, bind_endpoint, bind_endpoint_with_socket,
+    certificate_dir, fingerprint, transport_config,
 };
 pub use tunnel::ws::{
     TUNNEL_VERSION_HEADER, WsRole, WsUpgradeRequest, YamuxStream, YamuxTunnel, bearer_token,
